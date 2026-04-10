@@ -1,11 +1,13 @@
 // Copyright (c) 2026 AlphaOne LLC. All rights reserved.
 // Licensed under the MIT License. See LICENSE file in the project root.
 
+mod backend;
 mod color;
 mod config;
 mod db;
 mod embeddings;
 mod errors;
+mod fts;
 mod handlers;
 mod hnsw;
 mod llm;
@@ -13,6 +15,7 @@ mod mcp;
 mod mine;
 mod models;
 mod reranker;
+mod scoring;
 mod toon;
 mod validate;
 
@@ -61,6 +64,9 @@ struct Cli {
     /// Output as JSON (machine-parseable)
     #[arg(long, global = true, default_value_t = false)]
     json: bool,
+    /// Storage backend (currently: sqlite)
+    #[arg(long, env = "AI_MEMORY_BACKEND", default_value = "sqlite", global = true)]
+    backend: String,
 }
 
 #[derive(Subcommand)]

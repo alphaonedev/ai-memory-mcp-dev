@@ -6,7 +6,9 @@ use chrono::Utc;
 use rusqlite::{params, Connection};
 use std::path::Path;
 
+use crate::fts;
 use crate::models::*;
+use crate::scoring;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS memories (
@@ -345,7 +347,7 @@ pub fn forget(
 
     // If pattern provided, use FTS to find matching IDs
     if let Some(pat) = pattern {
-        let fts_query = sanitize_fts_query(pat, true);
+        let fts_query = fts::sanitize_fts5_query(pat, true);
         let tier_str = tier.map(|t| t.as_str().to_string());
         let deleted = conn.execute(
             "DELETE FROM memories WHERE rowid IN (
@@ -426,12 +428,15 @@ pub fn search(
 ) -> Result<Vec<Memory>> {
     let now = Utc::now().to_rfc3339();
     let tier_str = tier.map(|t| t.as_str().to_string());
-    let fts_query = sanitize_fts_query(query, false);
+    let fts_query = fts::sanitize_fts5_query(query, false);
 
+    // Over-fetch by 3× so Rust-side re-scoring can reorder accurately.
+    let fetch_limit = (limit * 3).max(30) as i64;
     let mut stmt = conn.prepare(
         "SELECT m.id, m.tier, m.namespace, m.title, m.content, m.tags, m.priority,
                 m.confidence, m.source, m.access_count, m.created_at, m.updated_at,
-                m.last_accessed_at, m.expires_at
+                m.last_accessed_at, m.expires_at,
+                fts.rank AS fts_rank
          FROM memories_fts fts
          JOIN memories m ON m.rowid = fts.rowid
          WHERE memories_fts MATCH ?1
@@ -442,12 +447,7 @@ pub fn search(
            AND (?6 IS NULL OR m.created_at >= ?6)
            AND (?7 IS NULL OR m.created_at <= ?7)
            AND (?8 IS NULL OR EXISTS (SELECT 1 FROM json_each(m.tags) WHERE json_each.value = ?8))
-         ORDER BY (fts.rank * -1)
-           + (m.priority * 0.5)
-           + (MIN(m.access_count, 50) * 0.1)
-           + (m.confidence * 2.0)
-           + (1.0 / (1.0 + (julianday('now') - julianday(m.updated_at)) * 0.1))
-           DESC
+         ORDER BY fts.rank
          LIMIT ?9",
     )?;
     let rows = stmt.query_map(
@@ -460,15 +460,36 @@ pub fn search(
             since,
             until,
             tags_filter,
-            limit as i64
+            fetch_limit,
         ],
-        row_to_memory,
+        |row| {
+            let mem = row_to_memory(row)?;
+            let fts_rank: f64 = row.get(14)?;
+            Ok((mem, fts_rank))
+        },
     )?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(Into::into)
+
+    // Score in Rust (5-factor: no tier bonus for search).
+    let mut scored: Vec<(Memory, f64)> = rows
+        .filter_map(|r| r.ok())
+        .map(|(mem, fts_rank)| {
+            let s = scoring::search_score(
+                fts_rank,
+                mem.priority,
+                mem.access_count,
+                mem.confidence,
+                &mem.updated_at,
+            );
+            (mem, s)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(limit);
+    Ok(scored.into_iter().map(|(m, _)| m).collect())
 }
 
 /// Recall — fuzzy OR search + touch + auto-promote + TTL extension.
+/// Scoring is computed in Rust via `scoring::recall_score`.
 pub fn recall(
     conn: &Connection,
     context: &str,
@@ -479,19 +500,15 @@ pub fn recall(
     until: Option<&str>,
 ) -> Result<Vec<(Memory, f64)>> {
     let now = Utc::now().to_rfc3339();
-    let fts_query = sanitize_fts_query(context, true);
+    let fts_query = fts::sanitize_fts5_query(context, true);
 
+    // Over-fetch by 3× so Rust-side re-scoring can reorder accurately.
+    let fetch_limit = (limit * 3).max(30) as i64;
     let mut stmt = conn.prepare(
         "SELECT m.id, m.tier, m.namespace, m.title, m.content, m.tags, m.priority,
                 m.confidence, m.source, m.access_count, m.created_at, m.updated_at,
                 m.last_accessed_at, m.expires_at,
-                (fts.rank * -1)
-                + (m.priority * 0.5)
-                + (MIN(m.access_count, 50) * 0.1)
-                + (m.confidence * 2.0)
-                + (CASE m.tier WHEN 'long' THEN 3.0 WHEN 'mid' THEN 1.0 ELSE 0.0 END)
-                + (1.0 / (1.0 + (julianday('now') - julianday(m.updated_at)) * 0.1))
-                AS score
+                fts.rank AS fts_rank
          FROM memories_fts fts
          JOIN memories m ON m.rowid = fts.rowid
          WHERE memories_fts MATCH ?1
@@ -500,7 +517,7 @@ pub fn recall(
            AND (?4 IS NULL OR EXISTS (SELECT 1 FROM json_each(m.tags) WHERE json_each.value = ?4))
            AND (?5 IS NULL OR m.created_at >= ?5)
            AND (?6 IS NULL OR m.created_at <= ?6)
-         ORDER BY score DESC
+         ORDER BY fts.rank
          LIMIT ?7",
     )?;
     let rows = stmt.query_map(
@@ -511,28 +528,45 @@ pub fn recall(
             tags_filter,
             since,
             until,
-            limit as i64
+            fetch_limit,
         ],
         |row| {
             let mem = row_to_memory(row)?;
-            let score: f64 = row.get(14)?;
-            Ok((mem, score))
+            let fts_rank: f64 = row.get(14)?;
+            Ok((mem, fts_rank))
         },
     )?;
-    let results: Vec<(Memory, f64)> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+
+    // Score in Rust (6-factor: includes tier bonus).
+    let mut scored: Vec<(Memory, f64)> = rows
+        .filter_map(|r| r.ok())
+        .map(|(mem, fts_rank)| {
+            let s = scoring::recall_score(
+                fts_rank,
+                mem.priority,
+                mem.access_count,
+                mem.confidence,
+                &mem.tier,
+                &mem.updated_at,
+            );
+            (mem, s)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(limit);
 
     // Touch all recalled memories (bumps access, extends TTL, auto-promotes)
-    for (mem, _) in &results {
+    for (mem, _) in &scored {
         if let Err(e) = touch(conn, &mem.id) {
             tracing::warn!("touch failed for memory {}: {}", &mem.id, e);
         }
     }
-    Ok(results)
+    Ok(scored)
 }
 
 /// Detect potential contradictions: memories in same namespace with similar titles.
 pub fn find_contradictions(conn: &Connection, title: &str, namespace: &str) -> Result<Vec<Memory>> {
-    let fts_query = sanitize_fts_query(title, true);
+    let fts_query = fts::sanitize_fts5_query(title, true);
     let mut stmt = conn.prepare(
         "SELECT m.id, m.tier, m.namespace, m.title, m.content, m.tags, m.priority,
                 m.confidence, m.source, m.access_count, m.created_at, m.updated_at,
@@ -658,45 +692,7 @@ pub fn consolidate(
     }
 }
 
-fn sanitize_fts_query(input: &str, use_or: bool) -> String {
-    let joiner = if use_or { " OR " } else { " " };
-    let tokens: Vec<String> = input
-        .split_whitespace()
-        .filter(|t| !t.is_empty())
-        .filter(|t| {
-            // Filter out FTS5 boolean operators as standalone tokens
-            let upper = t.to_uppercase();
-            upper != "AND" && upper != "OR" && upper != "NOT" && upper != "NEAR"
-        })
-        .map(|token| {
-            // Strip ALL FTS5 special characters to prevent injection
-            let clean: String = token
-                .chars()
-                .filter(|c| {
-                    *c != '"'
-                        && *c != '*'
-                        && *c != '^'
-                        && *c != '{'
-                        && *c != '}'
-                        && *c != '('
-                        && *c != ')'
-                        && *c != ':'
-                        && *c != '-'
-                        && *c != '|'
-                })
-                .collect();
-            if clean.is_empty() {
-                return String::new();
-            }
-            format!("\"{}\"", clean)
-        })
-        .filter(|t| !t.is_empty())
-        .collect();
-    if tokens.is_empty() {
-        return "\"_empty_\"".to_string();
-    }
-    tokens.join(joiner)
-}
+// FTS query sanitization moved to `fts::sanitize_fts5_query`.
 
 pub fn list_namespaces(conn: &Connection) -> Result<Vec<NamespaceCount>> {
     let now = Utc::now().to_rfc3339();
@@ -920,6 +916,8 @@ pub fn get_all_embeddings(conn: &Connection) -> Result<Vec<(String, Vec<f32>)>> 
 /// Returns memories ranked by a blended score of keyword and semantic relevance.
 /// When an HNSW `vector_index` is provided, uses approximate nearest-neighbor
 /// search instead of scanning all embeddings linearly.
+///
+/// FTS scoring is now computed in Rust via `scoring::recall_score`.
 #[allow(clippy::too_many_arguments)]
 pub fn recall_hybrid(
     conn: &Connection,
@@ -933,7 +931,7 @@ pub fn recall_hybrid(
     vector_index: Option<&crate::hnsw::VectorIndex>,
 ) -> Result<Vec<(Memory, f64)>> {
     let now = Utc::now().to_rfc3339();
-    let fts_query = sanitize_fts_query(context, true);
+    let fts_query = fts::sanitize_fts5_query(context, true);
 
     // Step 1: Get FTS candidates (up to 3x limit to have a good pool)
     let fts_limit = (limit * 3).max(30);
@@ -941,11 +939,7 @@ pub fn recall_hybrid(
         "SELECT m.id, m.tier, m.namespace, m.title, m.content, m.tags, m.priority,
                 m.confidence, m.source, m.access_count, m.created_at, m.updated_at,
                 m.last_accessed_at, m.expires_at, m.embedding,
-                (fts.rank * -1) + (m.priority * 0.5) + (MIN(m.access_count, 50) * 0.1)
-                + (m.confidence * 2.0)
-                + (CASE m.tier WHEN 'long' THEN 3.0 WHEN 'mid' THEN 1.0 ELSE 0.0 END)
-                + (1.0 / (1.0 + (julianday('now') - julianday(m.updated_at)) * 0.1))
-                AS fts_score
+                fts.rank AS fts_rank
          FROM memories_fts fts
          JOIN memories m ON m.rowid = fts.rowid
          WHERE memories_fts MATCH ?1
@@ -954,7 +948,7 @@ pub fn recall_hybrid(
            AND (?4 IS NULL OR EXISTS (SELECT 1 FROM json_each(m.tags) WHERE json_each.value = ?4))
            AND (?5 IS NULL OR m.created_at >= ?5)
            AND (?6 IS NULL OR m.created_at <= ?6)
-         ORDER BY fts_score DESC
+         ORDER BY fts.rank
          LIMIT ?7",
     )?;
 
@@ -989,14 +983,23 @@ pub fn recall_hybrid(
         ],
         |row| {
             let mem = row_to_memory(row)?;
-            let fts_score: f64 = row.get(15)?;
-            Ok((mem, fts_score))
+            let fts_rank: f64 = row.get(15)?;
+            Ok((mem, fts_rank))
         },
     )?;
 
     let mut max_fts_score: f64 = 1.0;
     for row in fts_rows {
-        let (mem, fts_score) = row?;
+        let (mem, fts_rank) = row?;
+        // Compute recall score in Rust (replaces SQL julianday/CASE)
+        let fts_score = scoring::recall_score(
+            fts_rank,
+            mem.priority,
+            mem.access_count,
+            mem.confidence,
+            &mem.tier,
+            &mem.updated_at,
+        );
         if fts_score > max_fts_score {
             max_fts_score = fts_score;
         }
@@ -1081,10 +1084,7 @@ pub fn recall_hybrid(
         }
     }
 
-    // Normalize FTS scores and compute blended score.
-    // Adaptive blend: semantic weight decreases for longer content (embeddings
-    // lose information on long text; FTS stays precise).  Short memories
-    // (< 500 chars) get 50/50, long memories (> 5 000 chars) get 15/85.
+    // Normalize FTS scores and compute blended score via scoring::hybrid_blend.
     let mut results: Vec<(Memory, f64)> = scored
         .into_values()
         .map(|(mem, fts_score, cosine)| {
@@ -1093,16 +1093,7 @@ pub fn recall_hybrid(
             } else {
                 0.0
             };
-            let content_len = mem.content.len() as f64;
-            // Lerp semantic_weight from 0.50 (≤500 chars) to 0.15 (≥5000 chars)
-            let semantic_weight = if content_len <= 500.0 {
-                0.50
-            } else if content_len >= 5000.0 {
-                0.15
-            } else {
-                0.50 - 0.35 * ((content_len - 500.0) / 4500.0)
-            };
-            let blended = semantic_weight * cosine + (1.0 - semantic_weight) * norm_fts;
+            let blended = scoring::hybrid_blend(cosine, norm_fts, mem.content.len());
             (mem, blended)
         })
         .collect();
@@ -1537,18 +1528,19 @@ mod tests {
 
     #[test]
     fn sanitize_fts_strips_operators_and_quotes() {
+        use crate::fts::sanitize_fts5_query;
         // FTS5 special chars: " * ^ { } ( ) : - | are stripped
-        let sanitized = sanitize_fts_query("test* \"injection\" (drop)", true);
+        let sanitized = sanitize_fts5_query("test* \"injection\" (drop)", true);
         assert!(!sanitized.contains("*"));
         assert!(!sanitized.contains("("));
         assert!(!sanitized.contains(")"));
         // Standalone boolean operators are removed
-        let sanitized2 = sanitize_fts_query("hello AND world OR NOT NEAR test", true);
+        let sanitized2 = sanitize_fts5_query("hello AND world OR NOT NEAR test", true);
         assert!(sanitized2.contains("hello"));
         assert!(sanitized2.contains("world"));
         assert!(sanitized2.contains("test"));
         // Empty input returns placeholder
-        let sanitized3 = sanitize_fts_query("", true);
+        let sanitized3 = sanitize_fts5_query("", true);
         assert_eq!(sanitized3, "\"_empty_\"");
     }
 
