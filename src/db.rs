@@ -1559,4 +1559,74 @@ mod tests {
         let got = get(&conn, &id).unwrap().unwrap();
         assert_eq!(got.content, "Updated via sync");
     }
+
+    // --- Gap 2: Tx rollback on consolidate failure ---
+    // Consolidate with a non-existent ID should fail, rolling back completely.
+    #[test]
+    fn consolidate_rollback_on_bad_id() {
+        let conn = test_db();
+        let id1 = insert(&conn, &make_memory("Rollback A", "test", Tier::Mid, 5)).unwrap();
+        let bad_id = "nonexistent-id-xyz".to_string();
+
+        // Consolidate should fail because bad_id doesn't exist
+        let result = consolidate(
+            &conn,
+            &[id1.clone(), bad_id],
+            "Should not exist",
+            "This should be rolled back",
+            "test",
+            &Tier::Long,
+            "test",
+        );
+        assert!(result.is_err());
+
+        // The valid memory should still exist (tx rolled back, not partially deleted)
+        let still_exists = get(&conn, &id1).unwrap();
+        assert!(
+            still_exists.is_some(),
+            "valid memory was deleted by a failed consolidate — rollback broken"
+        );
+
+        // No new consolidated memory should exist
+        let all = list(&conn, Some("test"), None, 100, 0, None, None, None, None).unwrap();
+        assert_eq!(
+            all.len(),
+            1,
+            "expected exactly 1 memory after failed consolidate, got {}",
+            all.len()
+        );
+        assert_eq!(all[0].title, "Rollback A");
+    }
+
+    // --- Gap 6: Errors are surfaced, not swallowed ---
+    // Consolidate with bad ID returns Err with descriptive message.
+    #[test]
+    fn consolidate_error_is_descriptive() {
+        let conn = test_db();
+        let id1 = insert(&conn, &make_memory("Err surface A", "test", Tier::Mid, 5)).unwrap();
+        let result = consolidate(
+            &conn,
+            &[id1, "does-not-exist".to_string()],
+            "Title",
+            "Summary",
+            "test",
+            &Tier::Long,
+            "test",
+        );
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not found"),
+            "error should mention 'not found', got: {msg}"
+        );
+    }
+
+    // Touch on non-existent ID should succeed silently (no rows updated, no crash).
+    #[test]
+    fn touch_nonexistent_id_no_crash() {
+        let conn = test_db();
+        // Should not panic or error — just updates 0 rows
+        let result = touch(&conn, "nonexistent-touch-id");
+        assert!(result.is_ok());
+    }
 }

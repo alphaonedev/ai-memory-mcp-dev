@@ -3,6 +3,7 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use std::process::Command;
+use std::time::Duration;
 
 fn binary_path() -> String {
     // Build the binary first, then find it
@@ -69,6 +70,8 @@ fn bench_recall(c: &mut Criterion) {
     seed_memories(&binary, &db_path, 1000);
 
     let mut group = c.benchmark_group("recall");
+    group.measurement_time(Duration::from_secs(30));
+    group.sample_size(10);
 
     group.bench_function("short_query", |b| {
         b.iter(|| {
@@ -140,6 +143,8 @@ fn bench_search(c: &mut Criterion) {
     seed_memories(&binary, &db_path, 1000);
 
     let mut group = c.benchmark_group("search");
+    group.measurement_time(Duration::from_secs(30));
+    group.sample_size(10);
 
     group.bench_function("simple_search", |b| {
         b.iter(|| {
@@ -189,6 +194,8 @@ fn bench_insert(c: &mut Criterion) {
         .to_string();
 
     let mut group = c.benchmark_group("insert");
+    group.measurement_time(Duration::from_secs(30));
+    group.sample_size(10);
     let mut counter = 0u64;
 
     group.bench_function("store_memory", |b| {

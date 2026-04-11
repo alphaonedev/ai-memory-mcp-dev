@@ -582,4 +582,59 @@ mod tests {
         let removed = backend.gc().unwrap();
         assert_eq!(removed, 1);
     }
+
+    // --- Gap 1: Async Send bounds check ---
+    // Compile-time assertion: if this compiles, Box<dyn StorageBackend> is Send.
+    #[test]
+    fn storage_backend_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<Box<dyn StorageBackend>>();
+        assert_send::<SqliteBackend>();
+    }
+
+    // --- Gap 5: Backend mock tx isolation ---
+    // Multiple threads concurrently insert/recall through a shared Mutex<SqliteBackend>.
+    #[test]
+    fn concurrent_access_via_mutex() {
+        use std::sync::{Arc, Mutex};
+        let backend = Arc::new(Mutex::new(test_backend()));
+        let mut handles = vec![];
+
+        // Spawn 8 threads that each insert a memory
+        for i in 0..8 {
+            let backend = Arc::clone(&backend);
+            handles.push(std::thread::spawn(move || {
+                let mem = make_memory(
+                    &format!("Concurrent-{i}"),
+                    "isolation",
+                    Tier::Long,
+                );
+                let b = backend.lock().unwrap();
+                b.insert(&mem).unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // All 8 memories should be present
+        let b = backend.lock().unwrap();
+        let results = b.recall("Concurrent", Some("isolation"), 20, None, None, None).unwrap();
+        assert_eq!(results.len(), 8);
+
+        // Concurrent recalls should not corrupt data
+        drop(b);
+        let mut recall_handles = vec![];
+        for _ in 0..4 {
+            let backend = Arc::clone(&backend);
+            recall_handles.push(std::thread::spawn(move || {
+                let b = backend.lock().unwrap();
+                let r = b.recall("Concurrent", Some("isolation"), 20, None, None, None).unwrap();
+                assert_eq!(r.len(), 8);
+            }));
+        }
+        for h in recall_handles {
+            h.join().unwrap();
+        }
+    }
 }

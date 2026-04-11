@@ -233,4 +233,81 @@ mod tests {
         let results = idx.search(&make_embedding(&[1.0, 0.0, 0.0]), 5);
         assert!(results.iter().all(|h| h.id != "a"));
     }
+
+    // --- Gap 13: Hybrid recall race ---
+    // Concurrent inserts + searches should not panic or corrupt results.
+    #[test]
+    fn concurrent_insert_and_search() {
+        use std::sync::Arc;
+
+        let entries = vec![
+            ("seed".into(), make_embedding(&[1.0, 0.0, 0.0])),
+        ];
+        let idx = Arc::new(VectorIndex::build(entries));
+        let mut handles = vec![];
+
+        // 4 writer threads inserting entries
+        for i in 0..4 {
+            let idx = Arc::clone(&idx);
+            handles.push(std::thread::spawn(move || {
+                for j in 0..10 {
+                    let id = format!("w{i}-{j}");
+                    let angle = (i * 10 + j) as f32 * 0.1;
+                    idx.insert(id, make_embedding(&[angle.cos(), angle.sin(), 0.1]));
+                }
+            }));
+        }
+
+        // 4 reader threads searching concurrently
+        for _ in 0..4 {
+            let idx = Arc::clone(&idx);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..10 {
+                    let results = idx.search(&make_embedding(&[1.0, 0.0, 0.0]), 5);
+                    // Should always get valid results (no panic, no garbage)
+                    for hit in &results {
+                        assert!(!hit.id.is_empty());
+                        assert!(hit.distance.is_finite());
+                    }
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().expect("thread panicked during concurrent HNSW access");
+        }
+
+        // After all inserts: 1 seed + 40 inserts = 41 total
+        assert_eq!(idx.len(), 41);
+    }
+
+    // --- Gap 16: Memory cleanup after mass removal ---
+    // Insert many entries, remove them all, verify len() is 0 and rebuild works.
+    #[test]
+    fn mass_insert_remove_cleanup() {
+        let idx = VectorIndex::empty();
+        let n = 50;
+        for i in 0..n {
+            let angle = i as f32 * 0.1;
+            idx.insert(
+                format!("mem-{i}"),
+                make_embedding(&[angle.cos(), angle.sin(), 0.1]),
+            );
+        }
+        assert_eq!(idx.len(), n);
+
+        // Remove all
+        for i in 0..n {
+            idx.remove(&format!("mem-{i}"));
+        }
+        assert_eq!(idx.len(), 0);
+
+        // Search on empty index after removal should return nothing
+        let results = idx.search(&make_embedding(&[1.0, 0.0, 0.0]), 10);
+        assert!(results.is_empty());
+
+        // Rebuild should work on empty state
+        idx.rebuild();
+        assert_eq!(idx.len(), 0);
+    }
 }
