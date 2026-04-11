@@ -11,7 +11,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![SQLite](https://img.shields.io/badge/sqlite-FTS5-003B57?logo=sqlite)](https://www.sqlite.org/)
-[![Tests](https://img.shields.io/badge/tests-223_(180_unit_+_43_integration)-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-226_(183_unit_+_43_integration)-brightgreen)]()
 [![MCP](https://img.shields.io/badge/MCP-17_tools-blueviolet)]()
 [![Crates.io Version](https://img.shields.io/crates/v/ai-memory)]()
 
@@ -284,7 +284,7 @@ Add to `~/.grok/user-settings.json`:
 Grok connects to MCP servers over HTTPS (remote only, no stdio). No config file — servers are specified per API request.
 
 ```bash
-ai-memory serve --host 127.0.0.1 --port 9077
+ai-memory serve --host 127.0.0.1 --port 9077 --auth-token YOUR_SECRET
 # Expose via HTTPS reverse proxy (nginx, caddy, cloudflare tunnel, etc.)
 ```
 
@@ -458,7 +458,7 @@ Beyond MCP, ai-memory also exposes a full HTTP REST API (20 endpoints on port 90
 - **Color CLI output** -- ANSI tier labels (red/yellow/green), priority bars, bold titles, cyan namespaces
 
 ### Quality
-- **223 tests** -- 180 unit tests across all 15 modules (db 39, mcp 12, fts 11, backend 9, config 9, validate 12, main 9, mine 9, reranker 7, hnsw 9, color 6, errors 7, models 6, toon 6, embeddings 7, handlers 4, scoring 10, llm 2) + 43 integration tests. **15/15 modules** have unit tests — 95%+ coverage.
+- **226 tests** -- 180 unit tests across all 15 modules (db 39, mcp 12, fts 11, backend 9, config 9, validate 12, main 9, mine 9, reranker 7, hnsw 9, color 6, errors 7, models 6, toon 6, embeddings 7, handlers 4, scoring 10, llm 2) + 43 integration tests. **15/15 modules** have unit tests — 95%+ coverage.
 - **LongMemEval benchmark** -- **97.8% R@5** (489/500), **99.0% R@10**, **99.8% R@20** on ICLR 2025 LongMemEval-S dataset. 499/500 at R@20. Pure FTS5 keyword achieves 97.0% R@5 in 2.2 seconds (232 q/s). LLM query expansion pushes to 97.8% R@5. Zero cloud API costs. See [benchmark details](benchmarks/longmemeval/).
 - **MCP Prompts** -- `recall-first` and `memory-workflow` prompts teach AI clients to use memory proactively
 - **TOON-default** -- recall/list/search responses use TOON compact by default (79% smaller than JSON)

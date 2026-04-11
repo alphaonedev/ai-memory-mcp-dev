@@ -51,15 +51,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `validate_source()` trims before allowlist check (RT-28)
 - `validate_id()` rejects whitespace (RT-29)
 
+**Security fixes (full codebase review — 9 findings):**
+- `--auth-token` / `AI_MEMORY_AUTH_TOKEN` Bearer token authentication for HTTP API (F1/F7/F8)
+- CORS restricted to localhost origins only — prevents cross-origin exfiltration (F2)
+- `unsafe impl Send/Sync` guarded with `Device::Cpu` runtime assertion (F3)
+- SSRF warning logged for non-localhost Ollama/embed URLs at startup (F5)
+- Docker default changed from `--host 0.0.0.0` to `--host 127.0.0.1` (F6)
+- Sync command validates remote database schema before operating (F9)
+
 ### Added
 
-- 23 new unit tests covering all 42 red-team findings
+- 33 new unit tests covering all 42 red-team findings and 9 security findings
 - 7 earlier unit tests covering original 17 Phase 0 gaps
 - Explicit benchmark timeouts: `measurement_time(30s)` + `sample_size(10)` on all Criterion groups
 
 ### Changed
 
-- Test count: 161 → **223** (180 unit + 43 integration)
+- Test count: 161 → **226** (183 unit + 43 integration)
 - Updated test counts across all docs: README, CLAUDE.md, ROADMAP, DEVELOPER_GUIDE, ADMIN_GUIDE
 - 14 source files modified, +656 lines
 
