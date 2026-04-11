@@ -2,7 +2,7 @@
 
 > Development fork: `alphaonedev/ai-memory-mcp-dev`
 > Production repo: `alphaonedev/ai-memory-mcp`
-> Current production version: **v0.5.2** (2026-04-08)
+> Current production version: **v0.5.4** (2026-04-10)
 > Execution model: **AI-built, human-vetted** — Claude Code 24×7, orchestrated by AlphaOne
 
 ---
@@ -33,7 +33,7 @@ Promotion path: `feature/*` → `develop` → `main` → upstream release
 
 ## Phase 0 — Foundation (REQUIRED FIRST)
 
-**Target: v0.5.3 | LOE: 5–7 sessions | ETA: Week 1**
+**Target: v0.5.4 | LOE: 5–7 sessions | Status: COMPLETE**
 
 The entire roadmap depends on decoupling from raw SQLite. This unlocks every milestone below.
 
@@ -184,7 +184,7 @@ Requires Phase 0 `StorageBackend` trait. Backends can be built in parallel by mu
 
 | Phase | Milestone | Sessions | Calendar (24×7 agents) |
 |:-----:|-----------|:--------:|:----------------------:|
-| 0 | Foundation (v0.5.3) | 5–7 | **Week 1** |
+| 0 | Foundation (v0.5.4) ✅ | 5–7 | **COMPLETE** |
 | 1 | Semantic Intelligence (v0.6.0) | 6–8 | **Week 2** |
 | 2 | Multi-Agent (v0.7.0) | 6–8 | **Week 3** |
 | 3 | Cloud Sync (v0.8.0) | 6–8 | **Week 4** |
@@ -194,7 +194,7 @@ Requires Phase 0 `StorageBackend` trait. Backends can be built in parallel by mu
 | 7 | Future (v1.x+) | 8–12 | **Weeks 9–10+** |
 | | **TOTAL** | **58–78** | **~10 weeks** |
 
-**v0.5.2 → v1.0.0 GA in ~8 weeks.** Full exploratory roadmap complete in ~10 weeks.
+**v0.5.4 → v1.0.0 GA in ~7 weeks.** Full exploratory roadmap complete in ~10 weeks.
 
 At 4–8 sessions/day with parallel agent orchestration, phases with no cross-dependencies (e.g., Phase 4 + Phase 5 Tier 2 backends) can overlap, compressing the calendar further.
 
