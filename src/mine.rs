@@ -87,7 +87,11 @@ pub fn parse_claude(path: &Path) -> Result<Vec<Conversation>> {
         let val: serde_json::Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("ai-memory: skipping malformed JSONL line {}: {}", line_num + 1, e);
+                eprintln!(
+                    "ai-memory: skipping malformed JSONL line {}: {}",
+                    line_num + 1,
+                    e
+                );
                 continue;
             }
         };
@@ -385,13 +389,9 @@ fn extract_text_content(val: &serde_json::Value) -> Option<String> {
         let parts: Vec<String> = arr
             .iter()
             .filter_map(|p| {
-                if let Some(s) = p.as_str() {
-                    Some(s.to_string())
-                } else if let Some(s) = p["text"].as_str() {
-                    Some(s.to_string())
-                } else {
-                    None
-                }
+                p.as_str()
+                    .or_else(|| p["text"].as_str())
+                    .map(|s| s.to_string())
             })
             .collect();
         if !parts.is_empty() {

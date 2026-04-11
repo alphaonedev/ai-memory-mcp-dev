@@ -113,7 +113,10 @@ mod tests {
         let decay = recency_decay("not-a-date");
         // Bad input falls back to 36500 days (100 years) → near-zero score
         // 1 / (1 + 36500 * 0.1) = 1 / 3651 ≈ 0.000274
-        assert!(decay < 0.001, "decay={decay} should be near zero for bad input");
+        assert!(
+            decay < 0.001,
+            "decay={decay} should be near zero for bad input"
+        );
     }
 
     #[test]
@@ -167,7 +170,11 @@ mod tests {
     #[test]
     fn recency_decay_bad_input_gets_minimum() {
         let decay = recency_decay("not-a-date");
-        assert!(decay < 0.001, "bad input should get near-zero recency, got {}", decay);
+        assert!(
+            decay < 0.001,
+            "bad input should get near-zero recency, got {}",
+            decay
+        );
     }
 
     // RT-11: Very old date gets low recency
@@ -175,6 +182,10 @@ mod tests {
     fn recency_decay_ancient_is_near_zero() {
         let ancient = "2000-01-01T00:00:00+00:00";
         let decay = recency_decay(ancient);
-        assert!(decay < 0.02, "ancient date should have very low recency, got {}", decay);
+        assert!(
+            decay < 0.02,
+            "ancient date should have very low recency, got {}",
+            decay
+        );
     }
 }

@@ -27,6 +27,7 @@ use crate::models::*;
 /// Every method mirrors a public function in `db.rs`.  Future backends
 /// (PostgreSQL + pgvector, Qdrant, etc.) implement the same surface.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 /// Callers needing thread-safety wrap the backend in `Mutex<Box<dyn StorageBackend>>`.
 /// `Sync` is intentionally omitted: `rusqlite::Connection` is `Send` but not `Sync`.
 pub trait StorageBackend: Send {
@@ -111,7 +112,8 @@ pub trait StorageBackend: Send {
 
     fn create_link(&self, source_id: &str, target_id: &str, relation: &str) -> Result<()>;
     fn get_links(&self, id: &str) -> Result<Vec<MemoryLink>>;
-    fn delete_link(&self, source_id: &str, target_id: &str, relation: Option<&str>) -> Result<bool>;
+    fn delete_link(&self, source_id: &str, target_id: &str, relation: Option<&str>)
+        -> Result<bool>;
 
     // -- Lifecycle ----------------------------------------------------------
 
@@ -177,11 +179,13 @@ pub trait StorageBackend: Send {
 // ---------------------------------------------------------------------------
 
 /// Default backend — wraps a `rusqlite::Connection` and delegates to `db::*`.
+#[allow(dead_code)]
 pub struct SqliteBackend {
     conn: rusqlite::Connection,
     db_path: PathBuf,
 }
 
+#[allow(dead_code)]
 impl SqliteBackend {
     /// Open (or create) a SQLite database at `path`.
     pub fn open(path: &Path) -> Result<Self> {
@@ -245,7 +249,15 @@ impl StorageBackend for SqliteBackend {
         since: Option<&str>,
         until: Option<&str>,
     ) -> Result<Vec<(Memory, f64)>> {
-        db::recall(&self.conn, context, namespace, limit, tags_filter, since, until)
+        db::recall(
+            &self.conn,
+            context,
+            namespace,
+            limit,
+            tags_filter,
+            since,
+            until,
+        )
     }
 
     fn search(
@@ -328,7 +340,12 @@ impl StorageBackend for SqliteBackend {
         db::get_links(&self.conn, id)
     }
 
-    fn delete_link(&self, source_id: &str, target_id: &str, relation: Option<&str>) -> Result<bool> {
+    fn delete_link(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        relation: Option<&str>,
+    ) -> Result<bool> {
         db::delete_link(&self.conn, source_id, target_id, relation)
     }
 
@@ -418,22 +435,23 @@ impl StorageBackend for SqliteBackend {
 // BackendRegistry
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 type BackendFactory = Box<dyn Fn(&Path) -> Result<Box<dyn StorageBackend>> + Send>;
 
 /// Maps backend names to factory functions.
+#[allow(dead_code)]
 pub struct BackendRegistry {
     factories: HashMap<String, BackendFactory>,
 }
 
+#[allow(dead_code)]
 impl BackendRegistry {
     /// Create a registry pre-loaded with the built-in SQLite backend.
     pub fn new() -> Self {
         let mut reg = Self {
             factories: HashMap::new(),
         };
-        reg.register("sqlite", |path| {
-            Ok(Box::new(SqliteBackend::open(path)?))
-        });
+        reg.register("sqlite", |path| Ok(Box::new(SqliteBackend::open(path)?)));
         reg
     }
 
@@ -518,9 +536,7 @@ mod tests {
         backend
             .insert(&make_memory("Rust language", "test", Tier::Long))
             .unwrap();
-        let results = backend
-            .recall("Rust", None, 10, None, None, None)
-            .unwrap();
+        let results = backend.recall("Rust", None, 10, None, None, None).unwrap();
         assert!(!results.is_empty());
         assert!(results[0].1 > 0.0);
     }
@@ -609,11 +625,7 @@ mod tests {
         for i in 0..8 {
             let backend = Arc::clone(&backend);
             handles.push(std::thread::spawn(move || {
-                let mem = make_memory(
-                    &format!("Concurrent-{i}"),
-                    "isolation",
-                    Tier::Long,
-                );
+                let mem = make_memory(&format!("Concurrent-{i}"), "isolation", Tier::Long);
                 let b = backend.lock().unwrap();
                 b.insert(&mem).unwrap();
             }));
@@ -624,7 +636,9 @@ mod tests {
 
         // All 8 memories should be present
         let b = backend.lock().unwrap();
-        let results = b.recall("Concurrent", Some("isolation"), 20, None, None, None).unwrap();
+        let results = b
+            .recall("Concurrent", Some("isolation"), 20, None, None, None)
+            .unwrap();
         assert_eq!(results.len(), 8);
 
         // Concurrent recalls should not corrupt data
@@ -634,7 +648,9 @@ mod tests {
             let backend = Arc::clone(&backend);
             recall_handles.push(std::thread::spawn(move || {
                 let b = backend.lock().unwrap();
-                let r = b.recall("Concurrent", Some("isolation"), 20, None, None, None).unwrap();
+                let r = b
+                    .recall("Concurrent", Some("isolation"), 20, None, None, None)
+                    .unwrap();
                 assert_eq!(r.len(), 8);
             }));
         }

@@ -1739,12 +1739,27 @@ mod tests {
         let conn = test_db();
         let id1 = insert(&conn, &make_memory("Prov A", "test", Tier::Mid, 5)).unwrap();
         let id2 = insert(&conn, &make_memory("Prov B", "test", Tier::Mid, 5)).unwrap();
-        let new_id = consolidate(&conn, &[id1.clone(), id2.clone()], "Merged", "Summary", "test", &Tier::Long, "test").unwrap();
+        let new_id = consolidate(
+            &conn,
+            &[id1.clone(), id2.clone()],
+            "Merged",
+            "Summary",
+            "test",
+            &Tier::Long,
+            "test",
+        )
+        .unwrap();
         let mem = get(&conn, &new_id).unwrap().unwrap();
         // Provenance should be in tags
-        assert!(mem.tags.iter().any(|t| t.starts_with("consolidated-from:")), "provenance tags missing");
+        assert!(
+            mem.tags.iter().any(|t| t.starts_with("consolidated-from:")),
+            "provenance tags missing"
+        );
         // Content should have provenance footer
-        assert!(mem.content.contains("Consolidated from:"), "provenance footer missing from content");
+        assert!(
+            mem.content.contains("Consolidated from:"),
+            "provenance footer missing from content"
+        );
     }
 
     // RT-6: update() is atomic — concurrent delete can't cause stale read
@@ -1755,7 +1770,19 @@ mod tests {
         let id = insert(&conn, &mem).unwrap();
         delete(&conn, &id).unwrap();
         // Update after delete should return false
-        let result = update(&conn, &id, Some("New title"), None, None, None, None, None, None, None).unwrap();
+        let result = update(
+            &conn,
+            &id,
+            Some("New title"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(!result, "update should return false for deleted memory");
     }
 
@@ -1767,7 +1794,10 @@ mod tests {
         let id = insert(&conn, &mem).unwrap();
         assert!(!id.is_empty());
         let got = get(&conn, &id).unwrap();
-        assert!(got.is_some(), "inserted memory should be retrievable by returned ID");
+        assert!(
+            got.is_some(),
+            "inserted memory should be retrievable by returned ID"
+        );
     }
 
     // RT-12: delete_link with relation filter
@@ -1815,7 +1845,11 @@ mod tests {
     #[test]
     fn search_does_not_silently_drop() {
         let conn = test_db();
-        insert(&conn, &make_memory("Drop test alpha", "test", Tier::Long, 5)).unwrap();
+        insert(
+            &conn,
+            &make_memory("Drop test alpha", "test", Tier::Long, 5),
+        )
+        .unwrap();
         insert(&conn, &make_memory("Drop test beta", "test", Tier::Long, 5)).unwrap();
         let results = search(&conn, "Drop test", None, None, 10, None, None, None, None).unwrap();
         assert_eq!(results.len(), 2);

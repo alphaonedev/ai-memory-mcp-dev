@@ -144,6 +144,7 @@ impl FeatureTier {
     }
 
     /// Automatically select the best tier that fits within `mb` megabytes.
+    #[allow(dead_code)]
     pub fn from_memory_budget(mb: usize) -> Self {
         if mb >= 4096 {
             Self::Autonomous
@@ -328,7 +329,10 @@ impl AppConfig {
         match FeatureTier::from_str(tier_str) {
             Some(t) => t,
             None => {
-                tracing::warn!("ai-memory: unknown tier '{}', falling back to semantic", tier_str);
+                tracing::warn!(
+                    "ai-memory: unknown tier '{}', falling back to semantic",
+                    tier_str
+                );
                 FeatureTier::Semantic
             }
         }

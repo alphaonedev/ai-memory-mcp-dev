@@ -159,7 +159,11 @@ impl VectorIndex {
                 }
             })
             .collect();
-        overflow_hits.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal));
+        overflow_hits.sort_by(|a, b| {
+            a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         results.extend(overflow_hits);
 
@@ -168,7 +172,11 @@ impl VectorIndex {
         results.retain(|hit| seen.insert(hit.id.clone()));
 
         // Sort by distance and truncate
-        results.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.truncate(k);
         results
     }
@@ -180,6 +188,7 @@ impl VectorIndex {
     }
 
     /// Force a full rebuild of the HNSW index from all entries.
+    #[allow(dead_code)]
     pub fn rebuild(&self) {
         let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         state.hnsw = Self::build_hnsw(&state.all_entries);
@@ -246,9 +255,7 @@ mod tests {
     fn concurrent_insert_and_search() {
         use std::sync::Arc;
 
-        let entries = vec![
-            ("seed".into(), make_embedding(&[1.0, 0.0, 0.0])),
-        ];
+        let entries = vec![("seed".into(), make_embedding(&[1.0, 0.0, 0.0]))];
         let idx = Arc::new(VectorIndex::build(entries));
         let mut handles = vec![];
 
@@ -280,7 +287,8 @@ mod tests {
         }
 
         for h in handles {
-            h.join().expect("thread panicked during concurrent HNSW access");
+            h.join()
+                .expect("thread panicked during concurrent HNSW access");
         }
 
         // After all inserts: 1 seed + 40 inserts = 41 total
@@ -320,9 +328,7 @@ mod tests {
     // RT-2: NaN distance doesn't panic
     #[test]
     fn nan_embedding_does_not_panic() {
-        let entries = vec![
-            ("a".into(), make_embedding(&[1.0, 0.0, 0.0])),
-        ];
+        let entries = vec![("a".into(), make_embedding(&[1.0, 0.0, 0.0]))];
         let idx = VectorIndex::build(entries);
         // Insert an embedding with NaN
         idx.insert("nan".into(), vec![f32::NAN, 0.0, 0.0]);
@@ -336,9 +342,10 @@ mod tests {
     #[test]
     fn mutex_recovery_after_panic() {
         use std::sync::Arc;
-        let idx = Arc::new(VectorIndex::build(vec![
-            ("seed".into(), make_embedding(&[1.0, 0.0, 0.0])),
-        ]));
+        let idx = Arc::new(VectorIndex::build(vec![(
+            "seed".into(),
+            make_embedding(&[1.0, 0.0, 0.0]),
+        )]));
         // After any internal issue, the index should still be usable
         idx.insert("post".into(), make_embedding(&[0.0, 1.0, 0.0]));
         let results = idx.search(&make_embedding(&[1.0, 0.0, 0.0]), 5);

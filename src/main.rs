@@ -65,7 +65,12 @@ struct Cli {
     #[arg(long, global = true, default_value_t = false)]
     json: bool,
     /// Storage backend (currently: sqlite)
-    #[arg(long, env = "AI_MEMORY_BACKEND", default_value = "sqlite", global = true)]
+    #[arg(
+        long,
+        env = "AI_MEMORY_BACKEND",
+        default_value = "sqlite",
+        global = true
+    )]
     backend: String,
 }
 
@@ -1759,7 +1764,7 @@ fn cmd_mine(db_path: PathBuf, args: MineArgs, json_out: bool) -> Result<()> {
             }
 
             // Commit in batches of 100
-            if imported % 100 == 0 && imported > 0 {
+            if imported.is_multiple_of(100) && imported > 0 {
                 conn.execute_batch("COMMIT")?;
                 conn.execute_batch("BEGIN")?;
             }

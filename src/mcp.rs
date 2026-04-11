@@ -906,6 +906,7 @@ fn handle_consolidate(
 
 // --- MCP protocol handler ---
 
+#[allow(clippy::too_many_arguments)]
 fn handle_request(
     conn: &rusqlite::Connection,
     db_path: &Path,
@@ -1151,7 +1152,10 @@ pub fn run_mcp_server(
                     Ok(unembedded) if !unembedded.is_empty() => {
                         let batch_limit = 100;
                         let batch_count = unembedded.len().min(batch_limit);
-                        eprintln!("ai-memory: backfilling {} memories (batch limit {})...", batch_count, batch_limit);
+                        eprintln!(
+                            "ai-memory: backfilling {} memories (batch limit {})...",
+                            batch_count, batch_limit
+                        );
                         let mut ok = 0usize;
                         for (id, title, content) in unembedded.iter().take(batch_limit) {
                             let text = format!("{} {}", title, content);
@@ -1163,12 +1167,11 @@ pub fn run_mcp_server(
                                 }
                                 Err(e) => {
                                     let end = 8.min(id.len());
-                                    let end = (0..=end).rev().find(|&i| id.is_char_boundary(i)).unwrap_or(0);
-                                    eprintln!(
-                                        "ai-memory: embed failed for {}: {}",
-                                        &id[..end],
-                                        e
-                                    );
+                                    let end = (0..=end)
+                                        .rev()
+                                        .find(|&i| id.is_char_boundary(i))
+                                        .unwrap_or(0);
+                                    eprintln!("ai-memory: embed failed for {}: {}", &id[..end], e);
                                 }
                             }
                         }
@@ -1254,7 +1257,11 @@ pub fn run_mcp_server(
             let resp = err_response(
                 Value::Null,
                 -32600,
-                format!("request too large ({} bytes, max {})", line.len(), MAX_LINE_LEN),
+                format!(
+                    "request too large ({} bytes, max {})",
+                    line.len(),
+                    MAX_LINE_LEN
+                ),
             );
             let out = serde_json::to_string(&resp)?;
             writeln!(stdout, "{out}")?;

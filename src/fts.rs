@@ -11,16 +11,18 @@
 ///
 /// Backends implement this to provide query sanitization and any
 /// engine-specific query translation.
+#[allow(dead_code)]
 pub trait TextSearch: Send + Sync {
     /// Sanitize user input into a safe full-text query string.
     ///
-    /// * `use_or` — `true` for fuzzy/recall (OR semantics),
-    ///              `false` for precise/search (AND semantics).
+    /// * `use_or` -- `true` for fuzzy/recall (OR semantics),
+    ///   `false` for precise/search (AND semantics).
     fn sanitize_query(&self, input: &str, use_or: bool) -> String;
 }
 
 /// SQLite FTS5 implementation of `TextSearch`.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct SqliteFts5;
 
 impl TextSearch for SqliteFts5 {
@@ -115,8 +117,14 @@ mod tests {
 
     #[test]
     fn empty_returns_placeholder() {
-        assert_eq!(sanitize_fts5_query("", true), "\"__aimemory_empty_query__\"");
-        assert_eq!(sanitize_fts5_query("   ", false), "\"__aimemory_empty_query__\"");
+        assert_eq!(
+            sanitize_fts5_query("", true),
+            "\"__aimemory_empty_query__\""
+        );
+        assert_eq!(
+            sanitize_fts5_query("   ", false),
+            "\"__aimemory_empty_query__\""
+        );
     }
 
     #[test]
@@ -140,7 +148,10 @@ mod tests {
 
     #[test]
     fn all_special_chars_yields_placeholder() {
-        assert_eq!(sanitize_fts5_query("***---|||", true), "\"__aimemory_empty_query__\"");
+        assert_eq!(
+            sanitize_fts5_query("***---|||", true),
+            "\"__aimemory_empty_query__\""
+        );
     }
 
     // RT-20: Backslash is stripped

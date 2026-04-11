@@ -30,7 +30,8 @@ fn is_valid_rfc3339(s: &str) -> bool {
 }
 
 fn is_clean_string(s: &str) -> bool {
-    !s.chars().any(|c| c == '\0' || (c.is_control() && c != '\t' && c != '\n' && c != '\r'))
+    !s.chars()
+        .any(|c| c == '\0' || (c.is_control() && c != '\t' && c != '\n' && c != '\r'))
 }
 
 pub fn validate_title(title: &str) -> Result<()> {
@@ -408,7 +409,7 @@ mod tests {
     #[test]
     fn test_title_length_includes_whitespace() {
         // A title that's within limit when trimmed but over limit with whitespace
-        let padded = format!("{}x{}", " ".repeat(256), " ".repeat(256));  // 513 bytes
+        let padded = format!("{}x{}", " ".repeat(256), " ".repeat(256)); // 513 bytes
         assert!(validate_title(&padded).is_err());
     }
 
