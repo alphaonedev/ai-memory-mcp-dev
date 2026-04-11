@@ -47,6 +47,9 @@ pub enum CrossEncoder {
     },
 }
 
+// SAFETY: BertModel with Device::Cpu uses only heap-allocated tensors that are
+// safe to send across threads. The Device::Cpu assertion in constructors
+// guarantees this invariant. GPU devices would make this unsound.
 unsafe impl Send for CrossEncoder {}
 unsafe impl Sync for CrossEncoder {}
 
@@ -74,6 +77,10 @@ impl CrossEncoder {
 
     fn load_neural() -> Result<Self> {
         let device = Device::Cpu;
+        assert!(
+            matches!(device, Device::Cpu),
+            "ai-memory requires CPU device for thread safety"
+        );
 
         let api = Api::new().context("failed to init HuggingFace Hub API")?;
         let repo = api.repo(Repo::new(
@@ -109,7 +116,8 @@ impl CrossEncoder {
             .map_err(|e| anyhow::anyhow!("failed to set truncation: {e}"))?;
         tokenizer.with_padding(None);
 
-        // Load model weights
+        // SAFETY: Memory-mapped safetensors file. The safetensors format validates
+        // tensor metadata on load. File must not be modified while mmap'd.
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&[weights_path], candle_core::DType::F32, &device)
                 .context("failed to load cross-encoder weights")?

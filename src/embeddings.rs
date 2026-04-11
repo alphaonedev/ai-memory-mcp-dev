@@ -42,8 +42,9 @@ pub enum Embedder {
     },
 }
 
-// BertModel does not implement Send/Sync by default but the CPU-backed
-// tensors are safe to share across threads.
+// SAFETY: BertModel with Device::Cpu uses only heap-allocated tensors that are
+// safe to send across threads. The Device::Cpu assertion in constructors
+// guarantees this invariant. GPU devices would make this unsound.
 unsafe impl Send for Embedder {}
 unsafe impl Sync for Embedder {}
 
@@ -58,6 +59,10 @@ impl Embedder {
     /// Create a local candle embedder (MiniLM-L6-v2, 384-dim).
     pub fn new_local() -> Result<Self> {
         let device = Device::Cpu;
+        assert!(
+            matches!(device, Device::Cpu),
+            "ai-memory requires CPU device for thread safety"
+        );
 
         let (config_path, tokenizer_path, weights_path) = match Self::download_via_hf_hub() {
             Ok(paths) => paths,
@@ -87,6 +92,8 @@ impl Embedder {
             .map_err(|e| anyhow::anyhow!("failed to set truncation: {e}"))?;
         tokenizer.with_padding(None);
 
+        // SAFETY: Memory-mapped safetensors file. The safetensors format validates
+        // tensor metadata on load. File must not be modified while mmap'd.
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&[weights_path], candle_core::DType::F32, &device)
                 .context("failed to load model weights")?

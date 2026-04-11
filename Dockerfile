@@ -44,4 +44,5 @@ EXPOSE 9077
 USER aimem
 
 ENTRYPOINT ["ai-memory"]
-CMD ["serve", "--host", "0.0.0.0"]
+# Default: localhost only. Use --host 0.0.0.0 with --auth-token for network access.
+CMD ["serve", "--host", "127.0.0.1"]

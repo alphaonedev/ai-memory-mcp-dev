@@ -367,6 +367,31 @@ impl AppConfig {
             .unwrap_or("http://localhost:11434")
     }
 
+    /// Log warnings for non-localhost URLs (call once at startup).
+    pub fn warn_non_localhost_urls(&self) {
+        let ollama = self.effective_ollama_url();
+        if !ollama.contains("localhost")
+            && !ollama.contains("127.0.0.1")
+            && !ollama.contains("[::1]")
+        {
+            tracing::warn!(
+                "ollama_url points to non-localhost: {} — ensure this is intentional (SSRF risk)",
+                ollama
+            );
+        }
+        let embed = self.effective_embed_url();
+        if embed != ollama
+            && !embed.contains("localhost")
+            && !embed.contains("127.0.0.1")
+            && !embed.contains("[::1]")
+        {
+            tracing::warn!(
+                "embed_url points to non-localhost: {} — ensure this is intentional (SSRF risk)",
+                embed
+            );
+        }
+    }
+
     /// Write a default config file if one doesn't exist yet.
     pub fn write_default_if_missing() {
         let Some(path) = Self::config_path() else {
