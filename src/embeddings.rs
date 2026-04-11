@@ -216,6 +216,9 @@ impl Embedder {
         let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
         let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
         let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if !dot.is_finite() || !norm_a.is_finite() || !norm_b.is_finite() {
+            return 0.0;
+        }
         let denom = norm_a * norm_b;
         if denom < 1e-12 {
             0.0
@@ -243,19 +246,41 @@ impl Embedder {
     fn load_from_fallback() -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)>
     {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-        let dir = std::path::PathBuf::from(home).join(FALLBACK_MODEL_SUBDIR);
-        let dir = dir.as_path();
+        let base = std::path::PathBuf::from(&home).join(FALLBACK_MODEL_SUBDIR);
+
+        // Try snapshots/main first
+        let dir = base.as_path();
         let config = dir.join("config.json");
         let tokenizer = dir.join("tokenizer.json");
         let weights = dir.join("model.safetensors");
         if config.exists() && tokenizer.exists() && weights.exists() {
-            Ok((config, tokenizer, weights))
-        } else {
-            anyhow::bail!(
-                "model files not found in fallback dir: {}. Download them manually from https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2",
-                dir.display()
-            )
+            return Ok((config, tokenizer, weights));
         }
+
+        // Fallback: scan snapshots/ for any subdirectory containing model files
+        let snapshots_dir = dir
+            .parent()
+            .unwrap_or(std::path::Path::new(""));
+        if snapshots_dir.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(snapshots_dir) {
+                for entry in entries.flatten() {
+                    let snap = entry.path();
+                    if snap.is_dir() {
+                        let c = snap.join("config.json");
+                        let t = snap.join("tokenizer.json");
+                        let w = snap.join("model.safetensors");
+                        if c.exists() && t.exists() && w.exists() {
+                            return Ok((c, t, w));
+                        }
+                    }
+                }
+            }
+        }
+
+        anyhow::bail!(
+            "model files not found in fallback dir: {} (also checked sibling snapshot dirs). Download them manually from https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2",
+            dir.display()
+        )
     }
 }
 
@@ -303,5 +328,23 @@ mod tests {
         let b = vec![1.0, 0.0]; // Different dimension
         let sim = Embedder::cosine_similarity(&a, &b);
         assert_eq!(sim, 0.0);
+    }
+
+    // RT-9: NaN inputs return 0.0
+    #[test]
+    fn cosine_similarity_nan_returns_zero() {
+        let a = vec![f32::NAN, 1.0, 0.0];
+        let b = vec![1.0, 0.0, 0.0];
+        let sim = Embedder::cosine_similarity(&a, &b);
+        assert_eq!(sim, 0.0, "NaN input should return 0.0");
+    }
+
+    // RT-9: Infinity inputs return 0.0
+    #[test]
+    fn cosine_similarity_infinity_returns_zero() {
+        let a = vec![f32::INFINITY, 1.0, 0.0];
+        let b = vec![1.0, 0.0, 0.0];
+        let sim = Embedder::cosine_similarity(&a, &b);
+        assert_eq!(sim, 0.0, "Infinity input should return 0.0");
     }
 }

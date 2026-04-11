@@ -21,6 +21,10 @@ impl Tier {
         }
     }
 
+    /// Parse a tier name. Returns `Option` for ergonomic use in match chains.
+    ///
+    /// Note: intentionally not implementing `std::str::FromStr` to return
+    /// `Option` instead of `Result` for simpler call-site ergonomics.
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "short" => Some(Self::Short),

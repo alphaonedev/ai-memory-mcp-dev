@@ -708,7 +708,7 @@ fn handle_delete(
 
 fn handle_promote(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
     let id = params["id"].as_str().ok_or("id is required")?;
-    db::update(
+    let updated = db::update(
         conn,
         id,
         None,
@@ -721,6 +721,9 @@ fn handle_promote(conn: &rusqlite::Connection, params: &Value) -> Result<Value, 
         None,
     )
     .map_err(|e| e.to_string())?;
+    if !updated {
+        return Err("memory not found".into());
+    }
     conn.execute(
         "UPDATE memories SET expires_at = NULL WHERE id = ?1",
         rusqlite::params![id],
@@ -1146,9 +1149,11 @@ pub fn run_mcp_server(
                 // Backfill embeddings for memories that don't have them
                 match db::get_unembedded_ids(&conn) {
                     Ok(unembedded) if !unembedded.is_empty() => {
-                        eprintln!("ai-memory: backfilling {} memories...", unembedded.len());
+                        let batch_limit = 100;
+                        let batch_count = unembedded.len().min(batch_limit);
+                        eprintln!("ai-memory: backfilling {} memories (batch limit {})...", batch_count, batch_limit);
                         let mut ok = 0usize;
-                        for (id, title, content) in &unembedded {
+                        for (id, title, content) in unembedded.iter().take(batch_limit) {
                             let text = format!("{} {}", title, content);
                             match emb.embed(&text) {
                                 Ok(embedding) => {
@@ -1157,15 +1162,23 @@ pub fn run_mcp_server(
                                     }
                                 }
                                 Err(e) => {
+                                    let end = 8.min(id.len());
+                                    let end = (0..=end).rev().find(|&i| id.is_char_boundary(i)).unwrap_or(0);
                                     eprintln!(
                                         "ai-memory: embed failed for {}: {}",
-                                        &id[..8.min(id.len())],
+                                        &id[..end],
                                         e
                                     );
                                 }
                             }
                         }
-                        eprintln!("ai-memory: backfilled {}/{}", ok, unembedded.len());
+                        eprintln!("ai-memory: backfilled {}/{}", ok, batch_count);
+                        if unembedded.len() > batch_limit {
+                            eprintln!(
+                                "ai-memory: {} memories still need embedding (will backfill on next startup)",
+                                unembedded.len() - batch_limit
+                            );
+                        }
                     }
                     _ => {}
                 }
@@ -1230,9 +1243,22 @@ pub fn run_mcp_server(
         effective_tier
     );
 
+    const MAX_LINE_LEN: usize = 1_048_576; // 1 MB
     for line in stdin.lock().lines() {
         let line = line?;
         if line.trim().is_empty() {
+            continue;
+        }
+
+        if line.len() > MAX_LINE_LEN {
+            let resp = err_response(
+                Value::Null,
+                -32600,
+                format!("request too large ({} bytes, max {})", line.len(), MAX_LINE_LEN),
+            );
+            let out = serde_json::to_string(&resp)?;
+            writeln!(stdout, "{out}")?;
+            stdout.flush()?;
             continue;
         }
 

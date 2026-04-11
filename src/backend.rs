@@ -111,7 +111,7 @@ pub trait StorageBackend: Send {
 
     fn create_link(&self, source_id: &str, target_id: &str, relation: &str) -> Result<()>;
     fn get_links(&self, id: &str) -> Result<Vec<MemoryLink>>;
-    fn delete_link(&self, source_id: &str, target_id: &str) -> Result<bool>;
+    fn delete_link(&self, source_id: &str, target_id: &str, relation: Option<&str>) -> Result<bool>;
 
     // -- Lifecycle ----------------------------------------------------------
 
@@ -193,6 +193,8 @@ impl SqliteBackend {
     }
 
     /// Borrow the raw connection (escape hatch for callers that still need it).
+    ///
+    /// # Safety: bypasses StorageBackend abstraction. Avoid in new code.
     pub fn conn(&self) -> &rusqlite::Connection {
         &self.conn
     }
@@ -326,8 +328,8 @@ impl StorageBackend for SqliteBackend {
         db::get_links(&self.conn, id)
     }
 
-    fn delete_link(&self, source_id: &str, target_id: &str) -> Result<bool> {
-        db::delete_link(&self.conn, source_id, target_id)
+    fn delete_link(&self, source_id: &str, target_id: &str, relation: Option<&str>) -> Result<bool> {
+        db::delete_link(&self.conn, source_id, target_id, relation)
     }
 
     fn touch(&self, id: &str) -> Result<()> {
@@ -440,6 +442,9 @@ impl BackendRegistry {
     where
         F: Fn(&Path) -> Result<Box<dyn StorageBackend>> + Send + 'static,
     {
+        if self.factories.contains_key(name) {
+            tracing::warn!("overwriting backend registration: {}", name);
+        }
         self.factories.insert(name.to_string(), Box::new(factory));
     }
 

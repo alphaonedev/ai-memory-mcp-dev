@@ -284,9 +284,13 @@ fn lexical_score(query: &str, title: &str, content: &str) -> f32 {
         .collect();
     let tf_idf = tfidf_score(&query_terms, &doc_all);
 
-    // 3. Bigram overlap bonus
-    let query_bigrams = bigrams(&query_terms);
-    let doc_bigrams = bigrams(&doc_all);
+    // 3. Bigram overlap bonus (case-insensitive)
+    let query_lower: Vec<String> = query_terms.iter().map(|t| t.to_lowercase()).collect();
+    let query_lower_refs: Vec<&str> = query_lower.iter().map(|s| s.as_str()).collect();
+    let doc_lower: Vec<String> = doc_all.iter().map(|t| t.to_lowercase()).collect();
+    let doc_lower_refs: Vec<&str> = doc_lower.iter().map(|s| s.as_str()).collect();
+    let query_bigrams = bigrams(&query_lower_refs);
+    let doc_bigrams = bigrams(&doc_lower_refs);
     let bigram_overlap = if query_bigrams.is_empty() {
         0.0
     } else {

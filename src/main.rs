@@ -464,7 +464,8 @@ async fn serve(db_path: PathBuf, args: ServeArgs) -> Result<()> {
             let lock = gc_state.lock().await;
             match db::gc(&lock.0) {
                 Ok(n) if n > 0 => tracing::info!("gc: expired {n} memories"),
-                _ => {}
+                Ok(_) => {}
+                Err(e) => tracing::warn!("gc error: {}", e),
             }
         }
     });
@@ -530,6 +531,9 @@ fn cmd_store(db_path: PathBuf, args: StoreArgs, json_out: bool) -> Result<()> {
         use std::io::Read;
         let mut buf = String::new();
         std::io::stdin().read_to_string(&mut buf)?;
+        if buf.len() > 10_000_000 {
+            anyhow::bail!("stdin input too large ({} bytes, max 10MB)", buf.len());
+        }
         buf
     } else {
         args.content
@@ -1148,6 +1152,9 @@ fn cmd_import(db_path: PathBuf, json_out: bool) -> Result<()> {
     use std::io::Read;
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf)?;
+    if buf.len() > 10_000_000 {
+        anyhow::bail!("stdin input too large ({} bytes, max 10MB)", buf.len());
+    }
     let data: serde_json::Value = serde_json::from_str(&buf)?;
     let memories: Vec<models::Memory> =
         serde_json::from_value(data.get("memories").cloned().unwrap_or_default())?;
@@ -1709,55 +1716,63 @@ fn cmd_mine(db_path: PathBuf, args: MineArgs, json_out: bool) -> Result<()> {
     let mut skipped = 0usize;
     let mut errors = 0usize;
 
-    // Use a transaction for bulk performance
-    conn.execute_batch("BEGIN")?;
+    // Use a transaction for bulk performance, with proper rollback on error
+    let result: Result<()> = (|| {
+        conn.execute_batch("BEGIN")?;
 
-    for conv in &filtered {
-        let mined = match mine::conversation_to_memory(conv, format) {
-            Some(m) => m,
-            None => {
-                skipped += 1;
-                continue;
+        for conv in &filtered {
+            let mined = match mine::conversation_to_memory(conv, format) {
+                Some(m) => m,
+                None => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+
+            let expires_at = tier
+                .default_ttl_secs()
+                .map(|s| (now + Duration::seconds(s)).to_rfc3339());
+
+            let mem = models::Memory {
+                id: uuid::Uuid::new_v4().to_string(),
+                tier: tier.clone(),
+                namespace: namespace.clone(),
+                title: mined.title,
+                content: mined.content,
+                tags: vec![format.source_tag().to_string()],
+                priority: 5,
+                confidence: 0.8,
+                source: mined.source_format,
+                access_count: 0,
+                created_at: mined.created_at.unwrap_or_else(|| now.to_rfc3339()),
+                updated_at: now.to_rfc3339(),
+                last_accessed_at: None,
+                expires_at,
+            };
+
+            match db::insert(&conn, &mem) {
+                Ok(_) => imported += 1,
+                Err(e) => {
+                    errors += 1;
+                    eprintln!("warning: failed to store '{}': {}", mem.title, e);
+                }
             }
-        };
 
-        let expires_at = tier
-            .default_ttl_secs()
-            .map(|s| (now + Duration::seconds(s)).to_rfc3339());
-
-        let mem = models::Memory {
-            id: uuid::Uuid::new_v4().to_string(),
-            tier: tier.clone(),
-            namespace: namespace.clone(),
-            title: mined.title,
-            content: mined.content,
-            tags: vec![format.source_tag().to_string()],
-            priority: 5,
-            confidence: 0.8,
-            source: mined.source_format,
-            access_count: 0,
-            created_at: mined.created_at.unwrap_or_else(|| now.to_rfc3339()),
-            updated_at: now.to_rfc3339(),
-            last_accessed_at: None,
-            expires_at,
-        };
-
-        match db::insert(&conn, &mem) {
-            Ok(_) => imported += 1,
-            Err(e) => {
-                errors += 1;
-                eprintln!("warning: failed to store '{}': {}", mem.title, e);
+            // Commit in batches of 100
+            if imported % 100 == 0 && imported > 0 {
+                conn.execute_batch("COMMIT")?;
+                conn.execute_batch("BEGIN")?;
             }
         }
 
-        // Commit in batches of 100
-        if imported % 100 == 0 && imported > 0 {
-            conn.execute_batch("COMMIT")?;
-            conn.execute_batch("BEGIN")?;
-        }
+        conn.execute_batch("COMMIT")?;
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(e);
     }
-
-    conn.execute_batch("COMMIT")?;
 
     if json_out {
         println!(

@@ -18,7 +18,8 @@ pub fn tier_bonus(tier: &Tier) -> f64 {
 }
 
 /// Recency decay: `1 / (1 + days_old * 0.1)`.
-/// Parses `updated_at` as RFC 3339; falls back to 0-day decay on parse failure.
+/// Parses `updated_at` as RFC 3339; falls back to 100-year decay on parse failure
+/// so corrupt/unparseable timestamps get minimum recency (near-zero score).
 pub fn recency_decay(updated_at: &str) -> f64 {
     let days_old = chrono::DateTime::parse_from_rfc3339(updated_at)
         .map(|dt| {
@@ -27,7 +28,7 @@ pub fn recency_decay(updated_at: &str) -> f64 {
                 .max(0);
             secs as f64 / 86_400.0
         })
-        .unwrap_or(0.0);
+        .unwrap_or(36500.0);
     1.0 / (1.0 + days_old * 0.1)
 }
 
@@ -110,7 +111,9 @@ mod tests {
     #[test]
     fn recency_decay_bad_input_fallback() {
         let decay = recency_decay("not-a-date");
-        assert!((decay - 1.0).abs() < f64::EPSILON);
+        // Bad input falls back to 36500 days (100 years) → near-zero score
+        // 1 / (1 + 36500 * 0.1) = 1 / 3651 ≈ 0.000274
+        assert!(decay < 0.001, "decay={decay} should be near zero for bad input");
     }
 
     #[test]
@@ -158,5 +161,20 @@ mod tests {
         let s1 = recall_score(-1.0, 5, 50, 1.0, &Tier::Mid, &now);
         let s2 = recall_score(-1.0, 5, 1000, 1.0, &Tier::Mid, &now);
         assert!((s1 - s2).abs() < f64::EPSILON);
+    }
+
+    // RT-11: Bad timestamps get minimum recency (near zero), not maximum
+    #[test]
+    fn recency_decay_bad_input_gets_minimum() {
+        let decay = recency_decay("not-a-date");
+        assert!(decay < 0.001, "bad input should get near-zero recency, got {}", decay);
+    }
+
+    // RT-11: Very old date gets low recency
+    #[test]
+    fn recency_decay_ancient_is_near_zero() {
+        let ancient = "2000-01-01T00:00:00+00:00";
+        let decay = recency_decay(ancient);
+        assert!(decay < 0.02, "ancient date should have very low recency, got {}", decay);
     }
 }

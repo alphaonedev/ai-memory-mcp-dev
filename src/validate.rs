@@ -30,7 +30,7 @@ fn is_valid_rfc3339(s: &str) -> bool {
 }
 
 fn is_clean_string(s: &str) -> bool {
-    !s.contains('\0')
+    !s.chars().any(|c| c == '\0' || (c.is_control() && c != '\t' && c != '\n' && c != '\r'))
 }
 
 pub fn validate_title(title: &str) -> Result<()> {
@@ -38,7 +38,7 @@ pub fn validate_title(title: &str) -> Result<()> {
     if trimmed.is_empty() {
         bail!("title cannot be empty");
     }
-    if trimmed.len() > MAX_TITLE_LEN {
+    if title.len() > MAX_TITLE_LEN {
         bail!("title exceeds max length of {} bytes", MAX_TITLE_LEN);
     }
     if !is_clean_string(trimmed) {
@@ -65,7 +65,7 @@ pub fn validate_namespace(ns: &str) -> Result<()> {
     if trimmed.is_empty() {
         bail!("namespace cannot be empty");
     }
-    if trimmed.len() > MAX_NAMESPACE_LEN {
+    if ns.len() > MAX_NAMESPACE_LEN {
         bail!(
             "namespace exceeds max length of {} bytes",
             MAX_NAMESPACE_LEN
@@ -87,7 +87,8 @@ pub fn validate_source(source: &str) -> Result<()> {
     if source.len() > MAX_SOURCE_LEN {
         bail!("source exceeds max length of {} bytes", MAX_SOURCE_LEN);
     }
-    if !VALID_SOURCES.contains(&source) {
+    let trimmed_source = source.trim();
+    if !VALID_SOURCES.contains(&trimmed_source) {
         bail!(
             "invalid source '{}' — must be one of: {}",
             source,
@@ -127,6 +128,9 @@ pub fn validate_id(id: &str) -> Result<()> {
     }
     if id.len() > MAX_ID_LEN {
         bail!("id exceeds max length of {} bytes", MAX_ID_LEN);
+    }
+    if id.contains(char::is_whitespace) {
+        bail!("id cannot contain whitespace");
     }
     if !is_clean_string(id) {
         bail!("id contains invalid characters");
@@ -384,5 +388,43 @@ mod tests {
     fn test_self_link_rejected() {
         assert!(validate_link("abc", "abc", "related_to").is_err());
         assert!(validate_link("abc", "def", "related_to").is_ok());
+    }
+
+    // RT-18: Control characters rejected
+    #[test]
+    fn test_reject_control_chars() {
+        assert!(validate_title("has\x01control").is_err());
+        assert!(validate_title("has\x1Bescape").is_err());
+        assert!(validate_title("has\x7Fdel").is_err());
+        // Tab and newline should be OK in content
+        assert!(validate_content("has\ttab").is_ok());
+        assert!(validate_content("has\nnewline").is_ok());
+        // But not in titles (titles shouldn't have newlines - actually is_clean_string allows \n)
+        // Control chars like \x01 should fail everywhere
+        assert!(validate_content("has\x01control").is_err());
+    }
+
+    // RT-19: Whitespace-padded input rejected if too long
+    #[test]
+    fn test_title_length_includes_whitespace() {
+        // A title that's within limit when trimmed but over limit with whitespace
+        let padded = format!("{}x{}", " ".repeat(256), " ".repeat(256));  // 513 bytes
+        assert!(validate_title(&padded).is_err());
+    }
+
+    // RT-28: Source with whitespace is trimmed
+    #[test]
+    fn test_source_trimmed() {
+        assert!(validate_source(" user ").is_ok());
+        assert!(validate_source("  claude  ").is_ok());
+    }
+
+    // RT-29: ID with whitespace rejected
+    #[test]
+    fn test_id_rejects_whitespace() {
+        assert!(validate_id("has space").is_err());
+        assert!(validate_id("has\ttab").is_err());
+        assert!(validate_id("has\nnewline").is_err());
+        assert!(validate_id("valid-id-123").is_ok());
     }
 }

@@ -84,8 +84,13 @@ pub fn parse_claude(path: &Path) -> Result<Vec<Conversation>> {
         if line.is_empty() {
             continue;
         }
-        let val: serde_json::Value = serde_json::from_str(line)
-            .with_context(|| format!("invalid JSON on line {}", line_num + 1))?;
+        let val: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("ai-memory: skipping malformed JSONL line {}: {}", line_num + 1, e);
+                continue;
+            }
+        };
 
         let conv = parse_claude_conversation(&val, line_num)?;
         if let Some(c) = conv {
@@ -142,7 +147,7 @@ fn parse_claude_conversation(
     }
     // Format 2: "mapping" object (tree of message nodes)
     else if let Some(mapping) = val["mapping"].as_object() {
-        let mut node_messages: Vec<(String, Message)> = Vec::new();
+        let mut node_messages: Vec<(f64, Message)> = Vec::new();
         for (_node_id, node) in mapping {
             if let Some(msg) = node["message"].as_object() {
                 let role = msg
@@ -169,8 +174,7 @@ fn parse_claude_conversation(
                     let sort_key = msg
                         .get("create_time")
                         .and_then(|t| t.as_f64())
-                        .unwrap_or(0.0)
-                        .to_string();
+                        .unwrap_or(0.0);
                     node_messages.push((
                         sort_key,
                         Message {
@@ -441,7 +445,7 @@ pub fn conversation_to_memory(conv: &Conversation, format: Format) -> Option<Min
         .title
         .as_deref()
         .filter(|t| !t.is_empty())
-        .map(|t| truncate(t, 100).to_string())
+        .map(|t| truncate(t, 100))
         .unwrap_or_else(|| {
             let first_user = conv
                 .messages
@@ -449,7 +453,7 @@ pub fn conversation_to_memory(conv: &Conversation, format: Format) -> Option<Min
                 .find(|m| m.role == "user" || m.role == "human")
                 .or(conv.messages.first());
             match first_user {
-                Some(m) => truncate(&m.content, 100).to_string(),
+                Some(m) => truncate(&m.content, 100),
                 None => format!("Conversation {}", &conv.id),
             }
         });
@@ -476,15 +480,13 @@ pub fn conversation_to_memory(conv: &Conversation, format: Format) -> Option<Min
     })
 }
 
-fn truncate(s: &str, max_chars: usize) -> &str {
-    if s.len() <= max_chars {
-        return s;
+fn truncate(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
     }
-    let mut end = max_chars;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
+    let mut result: String = s.chars().take(max_chars.saturating_sub(3)).collect();
+    result.push_str("...");
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -604,7 +606,7 @@ mod tests {
     #[test]
     fn test_truncate() {
         assert_eq!(truncate("hello", 10), "hello");
-        assert_eq!(truncate("hello world", 5), "hello");
+        assert_eq!(truncate("hello world", 8), "hello...");
     }
 
     #[test]

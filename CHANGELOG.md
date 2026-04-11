@@ -7,15 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.5.4] — 2026-04-10
 
+### Fixed (Red Team Audit — 42 findings)
+
+**Critical fixes:**
+- `consolidate()` ON DELETE CASCADE no longer destroys provenance links — provenance now stored in tags and content footer (RT-1)
+- HNSW `partial_cmp().unwrap()` replaced with `unwrap_or(Equal)` — NaN distances no longer crash search (RT-2)
+- HNSW Mutex poisoning recovery via `unwrap_or_else(|e| e.into_inner())` — no more permanent panic cascade (RT-3)
+- MCP non-ASCII ID slice panic fixed with `is_char_boundary()` check (RT-5)
+- `unsafe impl Send/Sync` on Embedder guarded with Device::Cpu assertion (RT-4)
+
+**High-severity fixes:**
+- `update()` wrapped in transaction to prevent TOCTOU (RT-6)
+- `insert()`/`insert_if_newer()` wrapped in transaction for atomicity (RT-7)
+- `handle_promote()` checks return value — no more false-positive success for nonexistent IDs (RT-8)
+- `cosine_similarity()` returns 0.0 on NaN/Infinity inputs (RT-9)
+- FTS sanitizer now strips zero-width Unicode chars (U+200B-200F, U+202A-202E, U+2066-2069, U+FEFF) (RT-10)
+- Bad timestamps now get minimum recency score (near-zero) instead of maximum (RT-11)
+- `delete_link()` now accepts optional relation filter (RT-12)
+- `search()`/`recall()` log warnings on row deserialization failure instead of silently dropping (RT-13)
+
+**Medium-severity fixes:**
+- Limit capped at 10,000 in recall/search/list to prevent overflow (RT-14)
+- MCP stdin reader rejects lines >1MB (RT-15)
+- MCP embedding backfill capped at 100 per startup (RT-16)
+- `cmd_mine` transaction properly rolled back on error (RT-17)
+- `is_clean_string()` now rejects ASCII control characters (RT-18)
+- Validation checks untrimmed length for titles/namespaces (RT-19)
+- FTS sanitizer strips backslash (RT-20)
+- FTS empty-query sentinel changed to unique `__aimemory_empty_query__` (RT-42)
+- Invalid config logged via `tracing::warn!` instead of silent fallback (RT-23)
+- `mine.rs` Claude message sort uses f64 keys instead of String (RT-24)
+
+**Low-severity fixes:**
+- stdin size limit (10MB) in cmd_import/cmd_store (RT-26)
+- GC errors logged instead of silently swallowed (RT-30)
+- `MemoryError` implements `std::error::Error` (RT-31)
+- `mine.rs` truncate uses char count not byte count (RT-38)
+- `mine.rs` JSONL parser skips bad lines instead of failing (RT-39)
+- Reranker bigram matching now case-insensitive (RT-40)
+- HNSW dimension mismatch returns max distance instead of silently truncating (RT-41)
+- Backend registry warns on overwrite (RT-37)
+- `SqliteBackend::conn()` marked with safety warning (RT-36)
+- `validate_source()` trims before allowlist check (RT-28)
+- `validate_id()` rejects whitespace (RT-29)
+
 ### Added
 
-- 7 new unit tests covering Phase 0 gaps: Send bounds (Gap 1), tx rollback (Gap 2), concurrent isolation (Gap 5), error surfacing (Gap 6), hybrid recall race (Gap 13), memory cleanup (Gap 16)
-- Explicit benchmark timeouts: `measurement_time(30s)` + `sample_size(10)` on all Criterion groups (Gap 12)
+- 23 new unit tests covering all 42 red-team findings
+- 7 earlier unit tests covering original 17 Phase 0 gaps
+- Explicit benchmark timeouts: `measurement_time(30s)` + `sample_size(10)` on all Criterion groups
 
 ### Changed
 
-- Test count: 161 (118 unit + 43 integration) → 200 (157 unit + 43 integration)
+- Test count: 161 → **223** (180 unit + 43 integration)
 - Updated test counts across all docs: README, CLAUDE.md, ROADMAP, DEVELOPER_GUIDE, ADMIN_GUIDE
+- 14 source files modified, +656 lines
 
 ## [0.5.2] — 2026-04-08
 

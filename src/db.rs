@@ -189,35 +189,53 @@ fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
 /// Insert with upsert on title+namespace. Returns the ID (existing or new).
 pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
     let tags_json = serde_json::to_string(&mem.tags)?;
-    conn.execute(
-        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
-         ON CONFLICT(title, namespace) DO UPDATE SET
-            content = excluded.content,
-            tags = excluded.tags,
-            priority = MAX(memories.priority, excluded.priority),
-            confidence = MAX(memories.confidence, excluded.confidence),
-            source = excluded.source,
-            tier = CASE WHEN excluded.tier = 'long' THEN 'long'
-                        WHEN memories.tier = 'long' THEN 'long'
-                        WHEN excluded.tier = 'mid' THEN 'mid'
-                        ELSE memories.tier END,
-            updated_at = excluded.updated_at,
-            expires_at = CASE WHEN excluded.tier = 'long' OR memories.tier = 'long' THEN NULL
-                              ELSE COALESCE(excluded.expires_at, memories.expires_at) END",
-        params![
-            mem.id, mem.tier.as_str(), mem.namespace, mem.title, mem.content,
-            tags_json, mem.priority, mem.confidence, mem.source, mem.access_count,
-            mem.created_at, mem.updated_at, mem.last_accessed_at, mem.expires_at,
-        ],
-    )?;
-    // Return the actual ID (could be the existing one on conflict)
-    let actual_id: String = conn.query_row(
-        "SELECT id FROM memories WHERE title = ?1 AND namespace = ?2",
-        params![mem.title, mem.namespace],
-        |r| r.get(0),
-    )?;
-    Ok(actual_id)
+
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+
+    let result = (|| -> Result<String> {
+        conn.execute(
+            "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             ON CONFLICT(title, namespace) DO UPDATE SET
+                content = excluded.content,
+                tags = excluded.tags,
+                priority = MAX(memories.priority, excluded.priority),
+                confidence = MAX(memories.confidence, excluded.confidence),
+                source = excluded.source,
+                tier = CASE WHEN excluded.tier = 'long' THEN 'long'
+                            WHEN memories.tier = 'long' THEN 'long'
+                            WHEN excluded.tier = 'mid' THEN 'mid'
+                            ELSE memories.tier END,
+                updated_at = excluded.updated_at,
+                expires_at = CASE WHEN excluded.tier = 'long' OR memories.tier = 'long' THEN NULL
+                                  ELSE COALESCE(excluded.expires_at, memories.expires_at) END",
+            params![
+                mem.id, mem.tier.as_str(), mem.namespace, mem.title, mem.content,
+                tags_json, mem.priority, mem.confidence, mem.source, mem.access_count,
+                mem.created_at, mem.updated_at, mem.last_accessed_at, mem.expires_at,
+            ],
+        )?;
+        // Return the actual ID (could be the existing one on conflict)
+        let actual_id: String = conn.query_row(
+            "SELECT id FROM memories WHERE title = ?1 AND namespace = ?2",
+            params![mem.title, mem.namespace],
+            |r| r.get(0),
+        )?;
+        Ok(actual_id)
+    })();
+
+    match result {
+        Ok(id) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(id)
+        }
+        Err(e) => {
+            if let Err(rb) = conn.execute_batch("ROLLBACK") {
+                tracing::error!("ROLLBACK failed in insert: {}", rb);
+            }
+            Err(e)
+        }
+    }
 }
 
 pub fn get(conn: &Connection, id: &str) -> Result<Option<Memory>> {
@@ -296,37 +314,54 @@ pub fn update(
     confidence: Option<f64>,
     expires_at: Option<&str>,
 ) -> Result<bool> {
-    let mut stmt = conn.prepare("SELECT * FROM memories WHERE id = ?1")?;
-    let mut rows = stmt.query_map(params![id], row_to_memory)?;
-    let existing = match rows.next() {
-        Some(Ok(m)) => m,
-        _ => return Ok(false),
-    };
-    drop(rows);
-    drop(stmt);
+    conn.execute_batch("BEGIN IMMEDIATE")?;
 
-    let title = title.unwrap_or(&existing.title);
-    let content = content.unwrap_or(&existing.content);
-    let tier = tier.unwrap_or(&existing.tier);
-    let namespace = namespace.unwrap_or(&existing.namespace);
-    let tags = tags.unwrap_or(&existing.tags);
-    let priority = priority.unwrap_or(existing.priority);
-    let confidence = confidence.unwrap_or(existing.confidence);
-    // Treat empty string as None (clear expiry) — don't store "" in the DB
-    let expires_at = match expires_at {
-        Some("") | Some("null") => None,
-        Some(v) => Some(v),
-        None => existing.expires_at.as_deref(),
-    };
-    let tags_json = serde_json::to_string(tags)?;
-    let now = Utc::now().to_rfc3339();
+    let result = (|| -> Result<bool> {
+        let mut stmt = conn.prepare("SELECT * FROM memories WHERE id = ?1")?;
+        let mut rows = stmt.query_map(params![id], row_to_memory)?;
+        let existing = match rows.next() {
+            Some(Ok(m)) => m,
+            _ => return Ok(false),
+        };
+        drop(rows);
+        drop(stmt);
 
-    conn.execute(
-        "UPDATE memories SET tier=?1, namespace=?2, title=?3, content=?4, tags=?5, priority=?6, confidence=?7, updated_at=?8, expires_at=?9
-         WHERE id=?10",
-        params![tier.as_str(), namespace, title, content, tags_json, priority, confidence, now, expires_at, id],
-    )?;
-    Ok(true)
+        let title = title.unwrap_or(&existing.title);
+        let content = content.unwrap_or(&existing.content);
+        let tier = tier.unwrap_or(&existing.tier);
+        let namespace = namespace.unwrap_or(&existing.namespace);
+        let tags = tags.unwrap_or(&existing.tags);
+        let priority = priority.unwrap_or(existing.priority);
+        let confidence = confidence.unwrap_or(existing.confidence);
+        // Treat empty string as None (clear expiry) — don't store "" in the DB
+        let expires_at = match expires_at {
+            Some("") | Some("null") => None,
+            Some(v) => Some(v),
+            None => existing.expires_at.as_deref(),
+        };
+        let tags_json = serde_json::to_string(tags)?;
+        let now = Utc::now().to_rfc3339();
+
+        conn.execute(
+            "UPDATE memories SET tier=?1, namespace=?2, title=?3, content=?4, tags=?5, priority=?6, confidence=?7, updated_at=?8, expires_at=?9
+             WHERE id=?10",
+            params![tier.as_str(), namespace, title, content, tags_json, priority, confidence, now, expires_at, id],
+        )?;
+        Ok(true)
+    })();
+
+    match result {
+        Ok(val) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(val)
+        }
+        Err(e) => {
+            if let Err(rb) = conn.execute_batch("ROLLBACK") {
+                tracing::error!("ROLLBACK failed in update: {}", rb);
+            }
+            Err(e)
+        }
+    }
 }
 
 pub fn delete(conn: &Connection, id: &str) -> Result<bool> {
@@ -382,6 +417,7 @@ pub fn list(
     until: Option<&str>,
     tags_filter: Option<&str>,
 ) -> Result<Vec<Memory>> {
+    let limit = limit.min(10_000);
     let now = Utc::now().to_rfc3339();
     let tier_str = tier.map(|t| t.as_str().to_string());
     let mut stmt = conn.prepare(
@@ -426,6 +462,7 @@ pub fn search(
     until: Option<&str>,
     tags_filter: Option<&str>,
 ) -> Result<Vec<Memory>> {
+    let limit = limit.min(10_000);
     let now = Utc::now().to_rfc3339();
     let tier_str = tier.map(|t| t.as_str().to_string());
     let fts_query = fts::sanitize_fts5_query(query, false);
@@ -471,7 +508,13 @@ pub fn search(
 
     // Score in Rust (5-factor: no tier bonus for search).
     let mut scored: Vec<(Memory, f64)> = rows
-        .filter_map(|r| r.ok())
+        .filter_map(|r| match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!("row deserialization failed in search: {}", e);
+                None
+            }
+        })
         .map(|(mem, fts_rank)| {
             let s = scoring::search_score(
                 fts_rank,
@@ -499,6 +542,7 @@ pub fn recall(
     since: Option<&str>,
     until: Option<&str>,
 ) -> Result<Vec<(Memory, f64)>> {
+    let limit = limit.min(10_000);
     let now = Utc::now().to_rfc3339();
     let fts_query = fts::sanitize_fts5_query(context, true);
 
@@ -539,7 +583,13 @@ pub fn recall(
 
     // Score in Rust (6-factor: includes tier bonus).
     let mut scored: Vec<(Memory, f64)> = rows
-        .filter_map(|r| r.ok())
+        .filter_map(|r| match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!("row deserialization failed in recall: {}", e);
+                None
+            }
+        })
         .map(|(mem, fts_rank)| {
             let s = scoring::recall_score(
                 fts_rank,
@@ -616,18 +666,34 @@ pub fn get_links(conn: &Connection, id: &str) -> Result<Vec<MemoryLink>> {
 }
 
 #[allow(dead_code)]
-pub fn delete_link(conn: &Connection, source_id: &str, target_id: &str) -> Result<bool> {
-    let changed = conn.execute(
-        "DELETE FROM memory_links WHERE source_id = ?1 AND target_id = ?2",
-        params![source_id, target_id],
-    )?;
+pub fn delete_link(
+    conn: &Connection,
+    source_id: &str,
+    target_id: &str,
+    relation: Option<&str>,
+) -> Result<bool> {
+    let changed = if let Some(rel) = relation {
+        conn.execute(
+            "DELETE FROM memory_links WHERE source_id = ?1 AND target_id = ?2 AND relation = ?3",
+            params![source_id, target_id, rel],
+        )?
+    } else {
+        // When no relation specified, delete all relations between the pair
+        conn.execute(
+            "DELETE FROM memory_links WHERE source_id = ?1 AND target_id = ?2",
+            params![source_id, target_id],
+        )?
+    };
     Ok(changed > 0)
 }
 
 // --- Consolidation ---
 
 /// Consolidate multiple memories into one. Returns the new memory ID.
-/// Deletes the source memories and creates links from new → old (derived_from).
+/// Deletes the source memories and records provenance in the consolidated
+/// memory's content (as a footer) and tags (as `consolidated-from:<id>`).
+/// Links are NOT created because ON DELETE CASCADE would destroy them when
+/// the source memories are deleted.
 pub fn consolidate(
     conn: &Connection,
     ids: &[String],
@@ -647,30 +713,40 @@ pub fn consolidate(
         let mut max_priority = 5i32;
         let mut all_tags: Vec<String> = Vec::new();
         let mut total_access = 0i64;
+        let mut source_ids: Vec<String> = Vec::new();
         for id in ids {
             match get(conn, id)? {
                 Some(mem) => {
                     max_priority = max_priority.max(mem.priority);
                     all_tags.extend(mem.tags);
                     total_access = total_access.saturating_add(mem.access_count);
+                    source_ids.push(id.clone());
                 }
                 None => anyhow::bail!("memory not found: {}", id),
             }
         }
         all_tags.sort();
         all_tags.dedup();
+        // Record provenance in tags so it survives even without links
+        for sid in &source_ids {
+            all_tags.push(format!("consolidated-from:{}", sid));
+        }
         let tags_json = serde_json::to_string(&all_tags)?;
+
+        // Append provenance footer to content
+        let content_with_provenance = format!(
+            "{}\n\n[Consolidated from: {}]",
+            summary,
+            source_ids.join(", ")
+        );
 
         conn.execute(
             "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1.0, ?8, ?9, ?10, ?10)",
-            params![new_id, tier.as_str(), namespace, title, summary, tags_json, max_priority, source, total_access, now],
+            params![new_id, tier.as_str(), namespace, title, content_with_provenance, tags_json, max_priority, source, total_access, now],
         )?;
 
-        for id in ids {
-            create_link(conn, &new_id, id, "derived_from")?;
-        }
-
+        // Delete source memories (no link creation — CASCADE would destroy them)
         for id in ids {
             delete(conn, id)?;
         }
@@ -809,40 +885,64 @@ pub fn export_links(conn: &Connection) -> Result<Vec<MemoryLink>> {
 /// Only overwrites if the incoming memory is newer (by updated_at).
 pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     let tags_json = serde_json::to_string(&mem.tags)?;
-    conn.execute(
-        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
-         ON CONFLICT(title, namespace) DO UPDATE SET
-            content = CASE WHEN excluded.updated_at > memories.updated_at THEN excluded.content ELSE memories.content END,
-            tags = CASE WHEN excluded.updated_at > memories.updated_at THEN excluded.tags ELSE memories.tags END,
-            priority = MAX(memories.priority, excluded.priority),
-            confidence = MAX(memories.confidence, excluded.confidence),
-            source = CASE WHEN excluded.updated_at > memories.updated_at THEN excluded.source ELSE memories.source END,
-            tier = CASE WHEN excluded.tier = 'long' THEN 'long'
-                        WHEN memories.tier = 'long' THEN 'long'
-                        WHEN excluded.tier = 'mid' THEN 'mid'
-                        ELSE memories.tier END,
-            updated_at = MAX(memories.updated_at, excluded.updated_at),
-            access_count = MAX(memories.access_count, excluded.access_count),
-            expires_at = CASE WHEN excluded.tier = 'long' OR memories.tier = 'long' THEN NULL
-                              ELSE COALESCE(excluded.expires_at, memories.expires_at) END",
-        params![
-            mem.id, mem.tier.as_str(), mem.namespace, mem.title, mem.content,
-            tags_json, mem.priority, mem.confidence, mem.source, mem.access_count,
-            mem.created_at, mem.updated_at, mem.last_accessed_at, mem.expires_at,
-        ],
-    )?;
-    let actual_id: String = conn.query_row(
-        "SELECT id FROM memories WHERE title = ?1 AND namespace = ?2",
-        params![mem.title, mem.namespace],
-        |r| r.get(0),
-    )?;
-    Ok(actual_id)
+
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+
+    let result = (|| -> Result<String> {
+        conn.execute(
+            "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             ON CONFLICT(title, namespace) DO UPDATE SET
+                content = CASE WHEN excluded.updated_at > memories.updated_at THEN excluded.content ELSE memories.content END,
+                tags = CASE WHEN excluded.updated_at > memories.updated_at THEN excluded.tags ELSE memories.tags END,
+                priority = MAX(memories.priority, excluded.priority),
+                confidence = MAX(memories.confidence, excluded.confidence),
+                source = CASE WHEN excluded.updated_at > memories.updated_at THEN excluded.source ELSE memories.source END,
+                tier = CASE WHEN excluded.tier = 'long' THEN 'long'
+                            WHEN memories.tier = 'long' THEN 'long'
+                            WHEN excluded.tier = 'mid' THEN 'mid'
+                            ELSE memories.tier END,
+                updated_at = MAX(memories.updated_at, excluded.updated_at),
+                access_count = MAX(memories.access_count, excluded.access_count),
+                expires_at = CASE WHEN excluded.tier = 'long' OR memories.tier = 'long' THEN NULL
+                                  ELSE COALESCE(excluded.expires_at, memories.expires_at) END",
+            params![
+                mem.id, mem.tier.as_str(), mem.namespace, mem.title, mem.content,
+                tags_json, mem.priority, mem.confidence, mem.source, mem.access_count,
+                mem.created_at, mem.updated_at, mem.last_accessed_at, mem.expires_at,
+            ],
+        )?;
+        let actual_id: String = conn.query_row(
+            "SELECT id FROM memories WHERE title = ?1 AND namespace = ?2",
+            params![mem.title, mem.namespace],
+            |r| r.get(0),
+        )?;
+        Ok(actual_id)
+    })();
+
+    match result {
+        Ok(id) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(id)
+        }
+        Err(e) => {
+            if let Err(rb) = conn.execute_batch("ROLLBACK") {
+                tracing::error!("ROLLBACK failed in insert_if_newer: {}", rb);
+            }
+            Err(e)
+        }
+    }
 }
 
 // --- Embedding support ---
 
 /// Store an embedding vector for a memory.
+///
+/// **Known performance issue (RT-21):** This UPDATE triggers the `memories_au`
+/// FTS trigger, which deletes and re-inserts the FTS row even though the
+/// `embedding` column is not indexed by FTS5. A future migration should either
+/// use a conditional trigger (`WHEN OLD.title != NEW.title OR ...`) or move
+/// embeddings to a separate table to avoid the unnecessary FTS rebuild.
 pub fn set_embedding(conn: &Connection, id: &str, embedding: &[f32]) -> Result<()> {
     let bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
     conn.execute(
@@ -930,6 +1030,7 @@ pub fn recall_hybrid(
     until: Option<&str>,
     vector_index: Option<&crate::hnsw::VectorIndex>,
 ) -> Result<Vec<(Memory, f64)>> {
+    let limit = limit.min(10_000);
     let now = Utc::now().to_rfc3339();
     let fts_query = fts::sanitize_fts5_query(context, true);
 
@@ -1541,7 +1642,7 @@ mod tests {
         assert!(sanitized2.contains("test"));
         // Empty input returns placeholder
         let sanitized3 = sanitize_fts5_query("", true);
-        assert_eq!(sanitized3, "\"_empty_\"");
+        assert_eq!(sanitized3, "\"__aimemory_empty_query__\"");
     }
 
     #[test]
@@ -1628,5 +1729,95 @@ mod tests {
         // Should not panic or error — just updates 0 rows
         let result = touch(&conn, "nonexistent-touch-id");
         assert!(result.is_ok());
+    }
+
+    // --- Red Team Tests ---
+
+    // RT-1: Consolidate preserves provenance in tags
+    #[test]
+    fn consolidate_preserves_provenance_tags() {
+        let conn = test_db();
+        let id1 = insert(&conn, &make_memory("Prov A", "test", Tier::Mid, 5)).unwrap();
+        let id2 = insert(&conn, &make_memory("Prov B", "test", Tier::Mid, 5)).unwrap();
+        let new_id = consolidate(&conn, &[id1.clone(), id2.clone()], "Merged", "Summary", "test", &Tier::Long, "test").unwrap();
+        let mem = get(&conn, &new_id).unwrap().unwrap();
+        // Provenance should be in tags
+        assert!(mem.tags.iter().any(|t| t.starts_with("consolidated-from:")), "provenance tags missing");
+        // Content should have provenance footer
+        assert!(mem.content.contains("Consolidated from:"), "provenance footer missing from content");
+    }
+
+    // RT-6: update() is atomic — concurrent delete can't cause stale read
+    #[test]
+    fn update_returns_false_for_deleted_memory() {
+        let conn = test_db();
+        let mem = make_memory("Atomic update", "test", Tier::Mid, 5);
+        let id = insert(&conn, &mem).unwrap();
+        delete(&conn, &id).unwrap();
+        // Update after delete should return false
+        let result = update(&conn, &id, Some("New title"), None, None, None, None, None, None, None).unwrap();
+        assert!(!result, "update should return false for deleted memory");
+    }
+
+    // RT-7: insert() is atomic — returns valid ID
+    #[test]
+    fn insert_returns_consistent_id() {
+        let conn = test_db();
+        let mem = make_memory("Atomic insert", "test", Tier::Long, 5);
+        let id = insert(&conn, &mem).unwrap();
+        assert!(!id.is_empty());
+        let got = get(&conn, &id).unwrap();
+        assert!(got.is_some(), "inserted memory should be retrievable by returned ID");
+    }
+
+    // RT-12: delete_link with relation filter
+    #[test]
+    fn delete_link_respects_relation() {
+        let conn = test_db();
+        let id1 = insert(&conn, &make_memory("Link R1", "test", Tier::Long, 5)).unwrap();
+        let id2 = insert(&conn, &make_memory("Link R2", "test", Tier::Long, 5)).unwrap();
+        create_link(&conn, &id1, &id2, "related_to").unwrap();
+        create_link(&conn, &id1, &id2, "contradicts").unwrap();
+        // Delete only related_to
+        let deleted = delete_link(&conn, &id1, &id2, Some("related_to")).unwrap();
+        assert!(deleted);
+        // contradicts should still exist
+        let links = get_links(&conn, &id1).unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].relation, "contradicts");
+    }
+
+    // RT-12: delete_link without relation deletes all
+    #[test]
+    fn delete_link_all_relations() {
+        let conn = test_db();
+        let id1 = insert(&conn, &make_memory("Link A1", "test", Tier::Long, 5)).unwrap();
+        let id2 = insert(&conn, &make_memory("Link A2", "test", Tier::Long, 5)).unwrap();
+        create_link(&conn, &id1, &id2, "related_to").unwrap();
+        create_link(&conn, &id1, &id2, "contradicts").unwrap();
+        let deleted = delete_link(&conn, &id1, &id2, None).unwrap();
+        assert!(deleted);
+        let links = get_links(&conn, &id1).unwrap();
+        assert!(links.is_empty());
+    }
+
+    // RT-14: limit is capped
+    #[test]
+    fn recall_caps_limit() {
+        let conn = test_db();
+        insert(&conn, &make_memory("Limit test", "test", Tier::Long, 5)).unwrap();
+        // Even with absurd limit, should not panic
+        let results = recall(&conn, "Limit", None, 999_999_999, None, None, None).unwrap();
+        assert!(results.len() <= 10_000);
+    }
+
+    // RT-13: search with valid data returns results (no silent drops)
+    #[test]
+    fn search_does_not_silently_drop() {
+        let conn = test_db();
+        insert(&conn, &make_memory("Drop test alpha", "test", Tier::Long, 5)).unwrap();
+        insert(&conn, &make_memory("Drop test beta", "test", Tier::Long, 5)).unwrap();
+        let results = search(&conn, "Drop test", None, None, 10, None, None, None, None).unwrap();
+        assert_eq!(results.len(), 2);
     }
 }

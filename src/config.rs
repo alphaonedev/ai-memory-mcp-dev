@@ -314,7 +314,7 @@ impl AppConfig {
                     cfg
                 }
                 Err(e) => {
-                    eprintln!("ai-memory: config parse error ({}): {}", path.display(), e);
+                    tracing::warn!("ai-memory: invalid config file, using defaults: {}", e);
                     Self::default()
                 }
             },
@@ -325,7 +325,13 @@ impl AppConfig {
     /// Resolve the effective feature tier from config (CLI flag overrides).
     pub fn effective_tier(&self, cli_tier: Option<&str>) -> FeatureTier {
         let tier_str = cli_tier.or(self.tier.as_deref()).unwrap_or("semantic");
-        FeatureTier::from_str(tier_str).unwrap_or(FeatureTier::Semantic)
+        match FeatureTier::from_str(tier_str) {
+            Some(t) => t,
+            None => {
+                tracing::warn!("ai-memory: unknown tier '{}', falling back to semantic", tier_str);
+                FeatureTier::Semantic
+            }
+        }
     }
 
     /// Resolve the effective database path (CLI flag overrides config).

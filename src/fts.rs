@@ -29,6 +29,21 @@ impl TextSearch for SqliteFts5 {
     }
 }
 
+/// Returns `true` for invisible/zero-width Unicode characters that could
+/// bypass search matching or inject directional overrides.
+fn is_invisible_unicode(c: char) -> bool {
+    matches!(c,
+        '\u{200B}'          // zero-width space
+        | '\u{200C}'        // zero-width non-joiner
+        | '\u{200D}'        // zero-width joiner
+        | '\u{FEFF}'        // BOM / zero-width no-break space
+        | '\u{200E}'        // LTR mark
+        | '\u{200F}'        // RTL mark
+        | '\u{202A}'..='\u{202E}' // directional overrides
+        | '\u{2066}'..='\u{2069}' // directional isolates
+    )
+}
+
 /// Core FTS5 sanitization: strips special characters, filters boolean
 /// operators, wraps tokens in quotes, and joins with OR or AND.
 pub fn sanitize_fts5_query(input: &str, use_or: bool) -> String {
@@ -54,6 +69,8 @@ pub fn sanitize_fts5_query(input: &str, use_or: bool) -> String {
                         && *c != ':'
                         && *c != '-'
                         && *c != '|'
+                        && *c != '\\'
+                        && !is_invisible_unicode(*c)
                 })
                 .collect();
             if clean.is_empty() {
@@ -64,7 +81,7 @@ pub fn sanitize_fts5_query(input: &str, use_or: bool) -> String {
         .filter(|t| !t.is_empty())
         .collect();
     if tokens.is_empty() {
-        return "\"_empty_\"".to_string();
+        return "\"__aimemory_empty_query__\"".to_string();
     }
     tokens.join(joiner)
 }
@@ -98,8 +115,8 @@ mod tests {
 
     #[test]
     fn empty_returns_placeholder() {
-        assert_eq!(sanitize_fts5_query("", true), "\"_empty_\"");
-        assert_eq!(sanitize_fts5_query("   ", false), "\"_empty_\"");
+        assert_eq!(sanitize_fts5_query("", true), "\"__aimemory_empty_query__\"");
+        assert_eq!(sanitize_fts5_query("   ", false), "\"__aimemory_empty_query__\"");
     }
 
     #[test]
@@ -123,6 +140,37 @@ mod tests {
 
     #[test]
     fn all_special_chars_yields_placeholder() {
-        assert_eq!(sanitize_fts5_query("***---|||", true), "\"_empty_\"");
+        assert_eq!(sanitize_fts5_query("***---|||", true), "\"__aimemory_empty_query__\"");
+    }
+
+    // RT-20: Backslash is stripped
+    #[test]
+    fn strips_backslash() {
+        let q = sanitize_fts5_query("test\\injection", true);
+        assert!(!q.contains('\\'));
+        assert!(q.contains("testinjection"));
+    }
+
+    // RT-10: Zero-width unicode chars are stripped
+    #[test]
+    fn strips_zero_width_chars() {
+        let q = sanitize_fts5_query("he\u{200B}llo wo\u{200D}rld", true);
+        assert!(q.contains("hello"));
+        assert!(q.contains("world"));
+        assert!(!q.contains('\u{200B}'));
+    }
+
+    // RT-10: Bidi override chars are stripped
+    #[test]
+    fn strips_bidi_overrides() {
+        let q = sanitize_fts5_query("test\u{202A}inject\u{202C}ion", true);
+        assert!(q.contains("testinjection"));
+    }
+
+    // RT-42: Unique sentinel for empty queries
+    #[test]
+    fn empty_sentinel_is_unique() {
+        let q = sanitize_fts5_query("", true);
+        assert!(q.contains("__aimemory_empty_query__"));
     }
 }

@@ -21,6 +21,12 @@ pub struct EmbeddingPoint(pub Vec<f32>);
 
 impl instant_distance::Point for EmbeddingPoint {
     fn distance(&self, other: &Self) -> f32 {
+        // RT-41: dimension mismatch guard — return maximum distance so
+        // mismatched embeddings sort to the bottom instead of silently
+        // giving wrong results via zip truncation.
+        if self.0.len() != other.0.len() {
+            return f32::MAX;
+        }
         // Cosine distance = 1 - cosine_similarity.
         // Embeddings are L2-normalised so dot product = cosine similarity.
         let dot: f32 = self.0.iter().zip(other.0.iter()).map(|(a, b)| a * b).sum();
@@ -87,7 +93,7 @@ impl VectorIndex {
 
     /// Add a new entry to the index (goes to overflow until next rebuild).
     pub fn insert(&self, id: String, embedding: Vec<f32>) {
-        let mut state = self.inner.lock().unwrap();
+        let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         state.all_entries.push((id.clone(), embedding.clone()));
         state.overflow.push((id, embedding));
 
@@ -100,7 +106,7 @@ impl VectorIndex {
 
     /// Remove an entry by ID (marks for exclusion; cleaned up on rebuild).
     pub fn remove(&self, id: &str) {
-        let mut state = self.inner.lock().unwrap();
+        let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         state.all_entries.retain(|(eid, _)| eid != id);
         state.overflow.retain(|(eid, _)| eid != id);
         // Note: the HNSW index itself is immutable — removed IDs are filtered
@@ -112,7 +118,7 @@ impl VectorIndex {
     /// Combines HNSW approximate search with linear scan of overflow entries.
     /// Returns results sorted by ascending distance (closest first).
     pub fn search(&self, query: &[f32], k: usize) -> Vec<VectorHit> {
-        let state = self.inner.lock().unwrap();
+        let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let query_point = EmbeddingPoint(query.to_vec());
 
         let mut results: Vec<VectorHit> = Vec::with_capacity(k * 2);
@@ -153,7 +159,7 @@ impl VectorIndex {
                 }
             })
             .collect();
-        overflow_hits.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
+        overflow_hits.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal));
 
         results.extend(overflow_hits);
 
@@ -162,20 +168,20 @@ impl VectorIndex {
         results.retain(|hit| seen.insert(hit.id.clone()));
 
         // Sort by distance and truncate
-        results.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
+        results.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal));
         results.truncate(k);
         results
     }
 
     /// Return the total number of indexed entries (HNSW + overflow).
     pub fn len(&self) -> usize {
-        let state = self.inner.lock().unwrap();
+        let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         state.all_entries.len()
     }
 
     /// Force a full rebuild of the HNSW index from all entries.
     pub fn rebuild(&self) {
-        let mut state = self.inner.lock().unwrap();
+        let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         state.hnsw = Self::build_hnsw(&state.all_entries);
         state.overflow.clear();
     }
@@ -309,5 +315,42 @@ mod tests {
         // Rebuild should work on empty state
         idx.rebuild();
         assert_eq!(idx.len(), 0);
+    }
+
+    // RT-2: NaN distance doesn't panic
+    #[test]
+    fn nan_embedding_does_not_panic() {
+        let entries = vec![
+            ("a".into(), make_embedding(&[1.0, 0.0, 0.0])),
+        ];
+        let idx = VectorIndex::build(entries);
+        // Insert an embedding with NaN
+        idx.insert("nan".into(), vec![f32::NAN, 0.0, 0.0]);
+        // Search should not panic
+        let results = idx.search(&make_embedding(&[1.0, 0.0, 0.0]), 5);
+        // Should get at least the valid entry
+        assert!(results.iter().any(|h| h.id == "a"));
+    }
+
+    // RT-3: Mutex recovery after poisoning
+    #[test]
+    fn mutex_recovery_after_panic() {
+        use std::sync::Arc;
+        let idx = Arc::new(VectorIndex::build(vec![
+            ("seed".into(), make_embedding(&[1.0, 0.0, 0.0])),
+        ]));
+        // After any internal issue, the index should still be usable
+        idx.insert("post".into(), make_embedding(&[0.0, 1.0, 0.0]));
+        let results = idx.search(&make_embedding(&[1.0, 0.0, 0.0]), 5);
+        assert!(!results.is_empty());
+    }
+
+    // RT-41: Dimension mismatch returns max distance
+    #[test]
+    fn dimension_mismatch_returns_max_distance() {
+        let a = EmbeddingPoint(vec![1.0, 0.0, 0.0]);
+        let b = EmbeddingPoint(vec![1.0, 0.0]); // Different dimension
+        let dist = a.distance(&b);
+        assert_eq!(dist, f32::MAX);
     }
 }

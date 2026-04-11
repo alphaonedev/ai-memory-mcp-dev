@@ -61,6 +61,8 @@ impl IntoResponse for MemoryError {
     }
 }
 
+impl std::error::Error for MemoryError {}
+
 impl std::fmt::Display for MemoryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "[{}] {}", self.code(), self.message())
@@ -153,5 +155,12 @@ mod tests {
         let json = serde_json::to_value(&api_err).unwrap();
         assert_eq!(json["code"], "TEST");
         assert_eq!(json["message"], "test msg");
+    }
+
+    // RT-31: MemoryError implements std::error::Error
+    #[test]
+    fn memory_error_implements_std_error() {
+        fn assert_error<T: std::error::Error>() {}
+        assert_error::<MemoryError>();
     }
 }
