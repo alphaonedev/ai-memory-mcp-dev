@@ -54,6 +54,7 @@ fn id_short(id: &str) -> &str {
 #[derive(Parser)]
 #[command(
     name = "ai-memory",
+    version = env!("CARGO_PKG_VERSION"),
     about = "AI-agnostic persistent memory — MCP server, HTTP API, and CLI for any AI platform"
 )]
 struct Cli {
