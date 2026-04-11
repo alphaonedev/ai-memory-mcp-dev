@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.4] — 2026-04-10
+
+### Added
+
+- 7 new unit tests covering Phase 0 gaps: Send bounds (Gap 1), tx rollback (Gap 2), concurrent isolation (Gap 5), error surfacing (Gap 6), hybrid recall race (Gap 13), memory cleanup (Gap 16)
+- Explicit benchmark timeouts: `measurement_time(30s)` + `sample_size(10)` on all Criterion groups (Gap 12)
+
+### Changed
+
+- Test count: 161 (118 unit + 43 integration) → 200 (157 unit + 43 integration)
+- Updated test counts across all docs: README, CLAUDE.md, ROADMAP, DEVELOPER_GUIDE, ADMIN_GUIDE
+
 ## [0.5.2] — 2026-04-08
 
 ### Added
