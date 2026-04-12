@@ -33,7 +33,7 @@ impl TextSearch for SqliteFts5 {
 
 /// Returns `true` for invisible/zero-width Unicode characters that could
 /// bypass search matching or inject directional overrides.
-fn is_invisible_unicode(c: char) -> bool {
+pub fn is_invisible_unicode(c: char) -> bool {
     matches!(c,
         '\u{200B}'          // zero-width space
         | '\u{200C}'        // zero-width non-joiner
@@ -60,6 +60,11 @@ pub fn sanitize_fts5_query(input: &str, use_or: bool) -> String {
         .map(|token| {
             let clean: String = token
                 .chars()
+                .map(|c| {
+                    // Replace hyphens with spaces so "BIND9-custom" becomes "BIND9 custom"
+                    // which FTS5 tokenizes correctly (RT-20)
+                    if c == '-' { ' ' } else { c }
+                })
                 .filter(|c| {
                     *c != '"'
                         && *c != '*'
@@ -69,16 +74,20 @@ pub fn sanitize_fts5_query(input: &str, use_or: bool) -> String {
                         && *c != '('
                         && *c != ')'
                         && *c != ':'
-                        && *c != '-'
                         && *c != '|'
                         && *c != '\\'
                         && !is_invisible_unicode(*c)
                 })
                 .collect();
-            if clean.is_empty() {
+            if clean.trim().is_empty() {
                 return String::new();
             }
-            format!("\"{clean}\"")
+            // Split on spaces produced by hyphen replacement to create separate tokens
+            clean
+                .split_whitespace()
+                .map(|w| format!("\"{w}\""))
+                .collect::<Vec<_>>()
+                .join(joiner)
         })
         .filter(|t| !t.is_empty())
         .collect();
@@ -183,5 +192,17 @@ mod tests {
     fn empty_sentinel_is_unique() {
         let q = sanitize_fts5_query("", true);
         assert!(q.contains("__aimemory_empty_query__"));
+    }
+
+    // RT-20: Hyphens replaced with spaces, not stripped
+    #[test]
+    fn hyphens_become_separate_tokens() {
+        let q = sanitize_fts5_query("BIND9-custom-config", true);
+        // Should contain separate tokens for each hyphen-separated word
+        assert!(q.contains("BIND9"), "should contain BIND9: {}", q);
+        assert!(q.contains("custom"), "should contain custom: {}", q);
+        assert!(q.contains("config"), "should contain config: {}", q);
+        // Should NOT contain the joined form
+        assert!(!q.contains("BIND9customconfig"), "should not join: {}", q);
     }
 }

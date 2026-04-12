@@ -5,7 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.5.4] — 2026-04-10
+## [0.5.4] — 2026-04-12
+
+### Fixed (Critical — Database Path Resolution)
+
+- **Default `--db` path changed from relative `ai-memory.db` to absolute XDG-compliant path** — the relative default caused silent database fragmentation across working directories, manifesting as total memory loss when invoking `ai-memory` from different directories. The new default is `~/.local/share/ai-memory/ai-memory.db` (respects `$XDG_DATA_HOME` if set)
+- **Tilde expansion (`~`) now works in `--db` flag and `config.toml` `db` key** — previously `db = "~/.claude/ai-memory.db"` in config.toml was treated as a literal path starting with `~`, not expanded to `$HOME`
+- **Config template updated** — default config.toml now documents the XDG default path and includes warnings about relative path fragmentation risk
+- **Relative path warning** — if a relative database path is resolved (via `--db` or config), a `tracing::warn!` is emitted alerting the user to fragmentation risk
+- **Parent directory auto-creation** — database parent directories are created automatically with mode 0700 (Unix) to prevent information disclosure to other system users
+
+### Added
+
+- **`doctor` subcommand** — diagnoses database fragmentation and config issues:
+  - Scans standard locations (`$HOME`, `~/.claude`, `~/.local/share/ai-memory`, CWD) plus user-supplied `--scan-dir` paths for stray database files
+  - Reports all found databases with memory count, file size, and primary/stray status
+  - Config diagnosis: effective path, absolute vs relative, config.toml status
+  - `--fix` flag: automatically merges stray databases into the primary via the existing sync engine, then renames merged files to `*.merged-YYYYMMDD` to prevent re-processing
+  - Full JSON output support (`--json`) for programmatic consumption
+  - Concurrent access warning emitted when `--fix` is used
+- 15 new unit tests for path resolution (tilde expansion, default path, effective_db priority, directory creation)
+- 7 new integration tests for doctor subcommand and path resolution behavior
+
+### Fixed (Red Team Phase 2 — 21 findings across 5 bug classes)
+
+**Critical:**
+- `cmd_mine` nested transaction crash — outer `BEGIN` conflicted with `db::insert`'s own `BEGIN IMMEDIATE`; refactored to use new `insert_no_tx` for batch operations (RT-21)
+
+**High:**
+- Stale embeddings after `memory_update` — updating title/content now invalidates the embedding so it gets re-embedded on next backfill (RT-07)
+- Zero-width Unicode bypass — invisible chars (ZWS, ZWJ, BOM, bidi overrides) now stripped from title/content before storage, matching FTS5 query sanitization (RT-10)
+- `create_link` opaque errors — now verifies both source and target memory IDs exist before inserting, returns clear "memory not found" error (RT-02)
+- HNSW rebuild panic safety — `catch_unwind` wraps HNSW index rebuild; on panic, overflow buffer is preserved for linear scan recovery (RT-03)
+- FTS5 hyphen handling — hyphens replaced with spaces instead of stripped, so "BIND9-custom" correctly matches as separate tokens (RT-20)
+
+**Medium:**
+- MCP store dedup now prevents tier/priority/confidence downgrade — matches SQL upsert `MAX()` semantics (RT-04)
+- Comma-separated tags filter — `--tags "rust,python"` now correctly matches memories with either tag across list/search/recall/recall_hybrid (RT-24)
+- Title validation uses char count instead of byte count — CJK titles no longer rejected at ~170 chars (RT-18)
+- Title length checked on trimmed string — whitespace-padded titles no longer falsely rejected (RT-19)
+
+**Low:**
+- `export_all` now filters expired memories — prevents resurrection of dead memories on import (RT-16)
 
 ### Fixed (Red Team Audit — 42 findings)
 
@@ -67,9 +108,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Test count: 161 → **226** (183 unit + 43 integration)
+- Test count: 161 → **258** (209 unit + 49 integration)
+- CLI command count: 25 → **26** (added `doctor`)
 - Updated test counts across all docs: README, CLAUDE.md, ROADMAP, DEVELOPER_GUIDE, ADMIN_GUIDE
-- 14 source files modified, +656 lines
+- 14 source files modified, +656 lines (Phase 0 audit); 3 additional files for path fix
 
 ## [0.5.2] — 2026-04-08
 

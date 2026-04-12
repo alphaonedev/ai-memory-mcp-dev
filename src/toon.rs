@@ -12,9 +12,11 @@
 use serde_json::Value;
 
 /// Standard memory fields in TOON column order.
+/// RT-13: includes content field so callers don't need extra memory_get calls.
 const MEMORY_FIELDS: &[&str] = &[
     "id",
     "title",
+    "content",
     "tier",
     "namespace",
     "priority",
@@ -178,8 +180,9 @@ mod tests {
         let toon = memories_to_toon(&resp, false);
         let lines: Vec<&str> = toon.lines().collect();
         assert_eq!(lines.len(), 3); // meta + header + 1 row
+        // RT-13: content field is now between title and tier in full TOON
         assert!(
-            lines[2].starts_with("abc-123|PostgreSQL config|long|infra|9|"),
+            lines[2].contains("abc-123|PostgreSQL config|") && lines[2].contains("|long|infra|9|"),
             "got: {}",
             lines[2]
         );
@@ -235,5 +238,28 @@ mod tests {
         let toon = search_to_toon(&resp, true);
         assert!(toon.contains("memories["));
         assert!(toon.contains("Found"));
+    }
+
+    // RT-13: full (non-compact) TOON includes content field
+    #[test]
+    fn full_toon_includes_content() {
+        let resp = json!({
+            "memories": [{"id": "x", "title": "Test", "content": "Full content here", "tier": "mid", "namespace": "test", "priority": 5, "confidence": 1.0, "score": 0.5, "access_count": 0, "tags": [], "source": "test", "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"}],
+            "count": 1
+        });
+        let toon = memories_to_toon(&resp, false);
+        assert!(toon.contains("content"), "full TOON header should include content field");
+        assert!(toon.contains("Full content here"), "full TOON should include content value");
+    }
+
+    // RT-13: compact TOON still omits content (for token efficiency)
+    #[test]
+    fn compact_toon_omits_content() {
+        let resp = json!({
+            "memories": [{"id": "x", "title": "Test", "content": "Hidden content", "tier": "mid"}],
+            "count": 1
+        });
+        let toon = memories_to_toon(&resp, true);
+        assert!(!toon.contains("Hidden content"), "compact TOON should not include content");
     }
 }

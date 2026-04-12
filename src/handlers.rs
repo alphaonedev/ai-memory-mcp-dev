@@ -40,6 +40,14 @@ pub async fn create_memory(
     State(state): State<Db>,
     Json(body): Json<CreateMemory>,
 ) -> impl IntoResponse {
+    // RT-09: defense-in-depth NaN check before validation
+    if body.confidence.is_nan() || body.confidence.is_infinite() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "confidence must be a finite number"})),
+        )
+            .into_response();
+    }
     if let Err(e) = validate::validate_create(&body) {
         return (
             StatusCode::BAD_REQUEST,
@@ -205,30 +213,9 @@ pub async fn promote_memory(State(state): State<Db>, Path(id): Path<String>) -> 
             .into_response();
     }
     let lock = state.lock().await;
-    match db::update(
-        &lock.0,
-        &id,
-        None,
-        None,
-        Some(&Tier::Long),
-        None,
-        None,
-        None,
-        None,
-        None,
-    ) {
+    // RT-01: atomic promote — tier + expiry cleared in single transaction
+    match db::promote(&lock.0, &id) {
         Ok(true) => {
-            if let Err(e) = lock.0.execute(
-                "UPDATE memories SET expires_at = NULL WHERE id = ?1",
-                rusqlite::params![id],
-            ) {
-                tracing::error!("promote clear expiry failed: {e}");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": "internal server error"})),
-                )
-                    .into_response();
-            }
             Json(json!({"promoted": true, "id": id, "tier": "long"})).into_response()
         }
         Ok(false) => (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response(),
@@ -540,25 +527,37 @@ pub async fn import_memories(
             .into_response();
     }
     let lock = state.lock().await;
-    let mut imported = 0usize;
+    // RT-12: validate first, then insert atomically
+    let mut validated = Vec::new();
     let mut errors = Vec::new();
     for mem in body.memories {
         if let Err(e) = validate::validate_memory(&mem) {
             errors.push(format!("{}: {}", mem.id, e));
             continue;
         }
-        match db::insert(&lock.0, &mem) {
-            Ok(_) => imported += 1,
-            Err(e) => errors.push(format!("{}: {}", mem.id, e)),
+        validated.push(mem);
+    }
+    match db::bulk_insert_atomic(&lock.0, &validated) {
+        Ok((imported, mut db_errors)) => {
+            errors.append(&mut db_errors);
+            // Import links after memories succeed
+            for link in body.links.unwrap_or_default() {
+                if validate::validate_link(&link.source_id, &link.target_id, &link.relation).is_err() {
+                    continue;
+                }
+                let _ = db::create_link(&lock.0, &link.source_id, &link.target_id, &link.relation);
+            }
+            Json(json!({"imported": imported, "errors": errors})).into_response()
+        }
+        Err(e) => {
+            tracing::error!("import transaction failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "import failed — transaction rolled back", "validation_errors": errors})),
+            )
+                .into_response()
         }
     }
-    for link in body.links.unwrap_or_default() {
-        if validate::validate_link(&link.source_id, &link.target_id, &link.relation).is_err() {
-            continue;
-        }
-        let _ = db::create_link(&lock.0, &link.source_id, &link.target_id, &link.relation);
-    }
-    Json(json!({"imported": imported, "errors": errors})).into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -635,7 +634,8 @@ pub async fn bulk_create(
     }
     let now = Utc::now();
     let lock = state.lock().await;
-    let mut created = 0usize;
+    // RT-12: validate all first, then insert atomically in one transaction
+    let mut validated = Vec::new();
     let mut errors = Vec::new();
     for body in bodies {
         if let Err(e) = validate::validate_create(&body) {
@@ -647,7 +647,7 @@ pub async fn bulk_create(
                 .or(body.tier.default_ttl_secs())
                 .map(|s| (now + Duration::seconds(s)).to_rfc3339())
         });
-        let mem = Memory {
+        validated.push(Memory {
             id: Uuid::new_v4().to_string(),
             tier: body.tier,
             namespace: body.namespace,
@@ -662,13 +662,22 @@ pub async fn bulk_create(
             updated_at: now.to_rfc3339(),
             last_accessed_at: None,
             expires_at,
-        };
-        match db::insert(&lock.0, &mem) {
-            Ok(_) => created += 1,
-            Err(e) => errors.push(e.to_string()),
+        });
+    }
+    match db::bulk_insert_atomic(&lock.0, &validated) {
+        Ok((created, mut db_errors)) => {
+            errors.append(&mut db_errors);
+            Json(json!({"created": created, "errors": errors})).into_response()
+        }
+        Err(e) => {
+            tracing::error!("bulk create transaction failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "bulk insert failed — transaction rolled back", "validation_errors": errors})),
+            )
+                .into_response()
         }
     }
-    Json(json!({"created": created, "errors": errors})).into_response()
 }
 
 #[cfg(test)]

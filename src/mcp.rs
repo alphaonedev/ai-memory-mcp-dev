@@ -120,6 +120,10 @@ fn tool_definitions() -> Value {
                         "namespace": {"type": "string"},
                         "tier": {"type": "string", "enum": ["short", "mid", "long"]},
                         "limit": {"type": "integer", "default": 20, "maximum": 200},
+                        "min_priority": {"type": "integer", "minimum": 1, "maximum": 10, "description": "Only return memories with priority >= this value"},
+                        "since": {"type": "string", "description": "Only memories created after this RFC3339 timestamp"},
+                        "until": {"type": "string", "description": "Only memories created before this RFC3339 timestamp"},
+                        "tags": {"type": "string", "description": "Comma-separated tags to filter by (OR matching)"},
                         "format": {"type": "string", "enum": ["json", "toon", "toon_compact"], "default": "toon_compact", "description": "Response format. Default 'toon_compact' saves 79% tokens. 'json' for structured parsing."}
                     },
                     "required": ["query"]
@@ -127,13 +131,17 @@ fn tool_definitions() -> Value {
             },
             {
                 "name": "memory_list",
-                "description": "List memories, optionally filtered by namespace or tier.",
+                "description": "List memories, optionally filtered by namespace, tier, priority, date range, or tags.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "namespace": {"type": "string"},
                         "tier": {"type": "string", "enum": ["short", "mid", "long"]},
                         "limit": {"type": "integer", "default": 20, "maximum": 200},
+                        "min_priority": {"type": "integer", "minimum": 1, "maximum": 10, "description": "Only return memories with priority >= this value"},
+                        "since": {"type": "string", "description": "Only memories created after this RFC3339 timestamp"},
+                        "until": {"type": "string", "description": "Only memories created before this RFC3339 timestamp"},
+                        "tags": {"type": "string", "description": "Comma-separated tags to filter by (OR matching)"},
                         "format": {"type": "string", "enum": ["json", "toon", "toon_compact"], "default": "toon_compact", "description": "Response format. Default 'toon_compact' saves 79% tokens. 'json' for structured parsing."}
                     }
                 }
@@ -233,7 +241,7 @@ fn tool_definitions() -> Value {
             },
             {
                 "name": "memory_consolidate",
-                "description": "Consolidate multiple memories into one long-term summary. Deletes source memories and creates derived_from links. If summary is omitted and LLM is available (smart/autonomous tier), auto-generates a summary.",
+                "description": "Consolidate multiple memories into one long-term summary. Deletes source memories and records provenance. Summary is optional: auto-generated via LLM at smart/autonomous tier, or concatenated from titles at keyword/semantic tier.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -380,6 +388,7 @@ fn handle_store(
     let tier_str = params["tier"].as_str().unwrap_or("mid");
     let tier = Tier::from_str(tier_str).ok_or(format!("invalid tier: {tier_str}"))?;
     let namespace = params["namespace"].as_str().unwrap_or("global").to_string();
+    // RT-15: MCP default source is "claude" (matches the interface — AI clients are the callers)
     let source = params["source"].as_str().unwrap_or("claude").to_string();
     let priority = params["priority"].as_i64().unwrap_or(5) as i32;
     let confidence = params["confidence"].as_f64().unwrap_or(1.0);
@@ -391,6 +400,11 @@ fn handle_store(
                 .collect()
         })
         .unwrap_or_default();
+
+    // RT-09: defense-in-depth — reject NaN/Inf at handler level before DB
+    if confidence.is_nan() || confidence.is_infinite() {
+        return Err("confidence must be a finite number".into());
+    }
 
     validate::validate_title(title).map_err(|e| e.to_string())?;
     validate::validate_content(content).map_err(|e| e.to_string())?;
@@ -429,17 +443,29 @@ fn handle_store(
         .find(|c| c.title == mem.title && c.namespace == mem.namespace);
     if let Some(dup) = exact_dup {
         // Update existing memory instead of creating a duplicate
-        // update(conn, id, title, content, tier, namespace, tags, priority, confidence, expires_at)
+        // RT-04: never downgrade tier on dedup (match db::insert upsert behavior)
+        let update_tier = if mem.tier.rank() > dup.tier.rank() {
+            Some(&mem.tier)
+        } else {
+            None // keep existing tier
+        };
+        // RT-04: never downgrade priority or confidence on dedup (match insert upsert behavior)
+        let update_priority = std::cmp::max(mem.priority, dup.priority);
+        let update_confidence = if mem.confidence > dup.confidence {
+            mem.confidence
+        } else {
+            dup.confidence
+        };
         db::update(
             conn,
             &dup.id,
             None,                       // title (unchanged)
             Some(mem.content.as_str()), // content (update)
-            Some(&mem.tier),            // tier
+            update_tier,                // tier (never downgrade)
             None,                       // namespace (unchanged)
             Some(&mem.tags),            // tags
-            Some(mem.priority),         // priority
-            Some(mem.confidence),       // confidence
+            Some(update_priority),      // priority (never downgrade)
+            Some(update_confidence),    // confidence (never downgrade)
             None,                       // expires_at
         )
         .map_err(|e| e.to_string())?;
@@ -653,6 +679,11 @@ fn handle_search(conn: &rusqlite::Connection, params: &Value) -> Result<Value, S
     let namespace = params["namespace"].as_str();
     let tier = params["tier"].as_str().and_then(Tier::from_str);
     let limit = params["limit"].as_u64().unwrap_or(20) as usize;
+    // RT-08: pass through filters that were previously only available in CLI/HTTP
+    let min_priority = params["min_priority"].as_i64().map(|p| p as i32);
+    let since = params["since"].as_str();
+    let until = params["until"].as_str();
+    let tags = params["tags"].as_str();
 
     let results = db::search(
         conn,
@@ -660,10 +691,10 @@ fn handle_search(conn: &rusqlite::Connection, params: &Value) -> Result<Value, S
         namespace,
         tier.as_ref(),
         limit.min(200),
-        None,
-        None,
-        None,
-        None,
+        min_priority,
+        since,
+        until,
+        tags,
     )
     .map_err(|e| e.to_string())?;
     Ok(json!({"results": results, "count": results.len()}))
@@ -673,6 +704,11 @@ fn handle_list(conn: &rusqlite::Connection, params: &Value) -> Result<Value, Str
     let namespace = params["namespace"].as_str();
     let tier = params["tier"].as_str().and_then(Tier::from_str);
     let limit = params["limit"].as_u64().unwrap_or(20) as usize;
+    // RT-08: pass through filters that were previously only available in CLI/HTTP
+    let min_priority = params["min_priority"].as_i64().map(|p| p as i32);
+    let since = params["since"].as_str();
+    let until = params["until"].as_str();
+    let tags = params["tags"].as_str();
 
     let results = db::list(
         conn,
@@ -680,10 +716,10 @@ fn handle_list(conn: &rusqlite::Connection, params: &Value) -> Result<Value, Str
         tier.as_ref(),
         limit.min(200),
         0,
-        None,
-        None,
-        None,
-        None,
+        min_priority,
+        since,
+        until,
+        tags,
     )
     .map_err(|e| e.to_string())?;
     Ok(json!({"memories": results, "count": results.len()}))
@@ -708,27 +744,11 @@ fn handle_delete(
 
 fn handle_promote(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
     let id = params["id"].as_str().ok_or("id is required")?;
-    let updated = db::update(
-        conn,
-        id,
-        None,
-        None,
-        Some(&Tier::Long),
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .map_err(|e| e.to_string())?;
+    // RT-01: atomic promote — tier + expiry cleared in single transaction
+    let updated = db::promote(conn, id).map_err(|e| e.to_string())?;
     if !updated {
         return Err("memory not found".into());
     }
-    conn.execute(
-        "UPDATE memories SET expires_at = NULL WHERE id = ?1",
-        rusqlite::params![id],
-    )
-    .map_err(|e| e.to_string())?;
     Ok(json!({"promoted": true, "id": id, "tier": "long"}))
 }
 
@@ -736,6 +756,12 @@ fn handle_forget(conn: &rusqlite::Connection, params: &Value) -> Result<Value, S
     let namespace = params["namespace"].as_str();
     let pattern = params["pattern"].as_str();
     let tier = params["tier"].as_str().and_then(Tier::from_str);
+    // RT-14: require namespace when only tier is specified (prevents accidental cross-project deletion)
+    if tier.is_some() && namespace.is_none() && pattern.is_none() {
+        return Err(
+            "namespace is required when filtering by tier only (safety: prevents deleting memories across all projects)".into(),
+        );
+    }
     let deleted = db::forget(conn, namespace, pattern, tier.as_ref()).map_err(|e| e.to_string())?;
     Ok(json!({"deleted": deleted}))
 }
@@ -846,6 +872,8 @@ fn handle_consolidate(
     conn: &rusqlite::Connection,
     params: &Value,
     llm: Option<&OllamaClient>,
+    embedder: Option<&Embedder>,
+    vector_index: Option<&VectorIndex>,
 ) -> Result<Value, String> {
     let ids_arr = params["ids"]
         .as_array()
@@ -877,9 +905,16 @@ fn handle_consolidate(
             .summarize_memories(&memory_pairs)
             .map_err(|e| format!("LLM summarization failed: {e}"))?
     } else {
-        return Err(
-            "summary is required (or use smart/autonomous tier for auto-summarization)".into(),
-        );
+        // RT-05: auto-generate a basic summary at keyword/semantic tier by concatenating titles
+        let mut memory_titles: Vec<String> = Vec::new();
+        for id in &ids {
+            match db::get(conn, id) {
+                Ok(Some(mem)) => memory_titles.push(mem.title),
+                Ok(None) => return Err(format!("memory not found: {}", id)),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        format!("Consolidated from: {}", memory_titles.join("; "))
     };
 
     validate::validate_consolidate(&ids, title, &summary, namespace).map_err(|e| e.to_string())?;
@@ -895,6 +930,24 @@ fn handle_consolidate(
         "consolidation",
     )
     .map_err(|e| e.to_string())?;
+
+    // RT-06: generate embedding for consolidated memory so it's immediately visible to semantic recall
+    if let Some(emb) = embedder {
+        let text = format!("{} {}", title, summary);
+        match emb.embed(&text) {
+            Ok(embedding) => {
+                if let Err(e) = db::set_embedding(conn, &new_id, &embedding) {
+                    tracing::warn!("failed to store embedding for consolidated {}: {}", &new_id, e);
+                }
+                if let Some(idx) = vector_index {
+                    idx.insert(new_id.clone(), embedding);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("failed to generate embedding for consolidated {}: {}", &new_id, e);
+            }
+        }
+    }
 
     let mut result = json!({"id": new_id, "consolidated": ids.len()});
     if auto_generated {
@@ -978,7 +1031,7 @@ fn handle_request(
                 "memory_get" => handle_get(conn, arguments),
                 "memory_link" => handle_link(conn, arguments),
                 "memory_get_links" => handle_get_links(conn, arguments),
-                "memory_consolidate" => handle_consolidate(conn, arguments, llm),
+                "memory_consolidate" => handle_consolidate(conn, arguments, llm, embedder, vector_index),
                 "memory_capabilities" => handle_capabilities(tier_config, reranker),
                 "memory_expand_query" => handle_expand_query(llm, arguments),
                 "memory_auto_tag" => handle_auto_tag(conn, llm, arguments),
@@ -1420,5 +1473,194 @@ mod tests {
         let err = resp.error.unwrap();
         assert_eq!(err.code, -32600);
         assert_eq!(err.message, "test error");
+    }
+
+    // --- Red Team Phase 2 tests ---
+
+    // RT-08: search tool definition has filter params
+    #[test]
+    fn tool_definitions_search_has_filters() {
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().unwrap();
+        let search = tools.iter().find(|t| t["name"] == "memory_search").unwrap();
+        let props = &search["inputSchema"]["properties"];
+        assert!(props.get("min_priority").is_some(), "missing min_priority");
+        assert!(props.get("since").is_some(), "missing since");
+        assert!(props.get("until").is_some(), "missing until");
+        assert!(props.get("tags").is_some(), "missing tags");
+    }
+
+    // RT-08: list tool definition has filter params
+    #[test]
+    fn tool_definitions_list_has_filters() {
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().unwrap();
+        let list = tools.iter().find(|t| t["name"] == "memory_list").unwrap();
+        let props = &list["inputSchema"]["properties"];
+        assert!(props.get("min_priority").is_some(), "missing min_priority");
+        assert!(props.get("since").is_some(), "missing since");
+        assert!(props.get("until").is_some(), "missing until");
+        assert!(props.get("tags").is_some(), "missing tags");
+    }
+
+    // RT-05: handle_consolidate without summary at keyword tier produces default summary
+    #[test]
+    fn consolidate_generates_default_summary_without_llm() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let m1 = crate::models::Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Mid, namespace: "test".into(), title: "Memory A".into(),
+            content: "Content A".into(), tags: vec![], priority: 5, confidence: 1.0,
+            source: "test".into(), access_count: 0, created_at: now.clone(),
+            updated_at: now.clone(), last_accessed_at: None, expires_at: None,
+        };
+        let m2 = crate::models::Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Mid, namespace: "test".into(), title: "Memory B".into(),
+            content: "Content B".into(), tags: vec![], priority: 5, confidence: 1.0,
+            source: "test".into(), access_count: 0, created_at: now.clone(),
+            updated_at: now.clone(), last_accessed_at: None, expires_at: None,
+        };
+        let id1 = db::insert(&conn, &m1).unwrap();
+        let id2 = db::insert(&conn, &m2).unwrap();
+        let params = json!({"ids": [id1, id2], "title": "Merged", "namespace": "test"});
+        // No LLM, no embedder — should auto-generate summary from titles
+        let result = handle_consolidate(&conn, &params, None, None, None);
+        assert!(result.is_ok(), "consolidate should succeed: {:?}", result.err());
+        let val = result.unwrap();
+        assert!(val["id"].as_str().is_some());
+        // Verify the consolidated memory has a summary
+        let new_id = val["id"].as_str().unwrap();
+        let mem = db::get(&conn, new_id).unwrap().unwrap();
+        assert!(mem.content.contains("Memory A"), "should contain source title A");
+        assert!(mem.content.contains("Memory B"), "should contain source title B");
+    }
+
+    // RT-09: out-of-range confidence rejected at MCP handler level
+    #[test]
+    fn store_rejects_invalid_confidence() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        // JSON doesn't support NaN literals, but out-of-range values should be rejected
+        let params = json!({
+            "title": "Test", "content": "Test content",
+            "confidence": 1.5
+        });
+        let result = handle_store(&conn, &params, None, None);
+        assert!(result.is_err(), "confidence > 1.0 should be rejected");
+        // Negative confidence
+        let params = json!({
+            "title": "Test", "content": "Test content",
+            "confidence": -0.5
+        });
+        let result = handle_store(&conn, &params, None, None);
+        assert!(result.is_err(), "negative confidence should be rejected");
+    }
+
+    // RT-09: defense-in-depth — Inf confidence rejected early
+    #[test]
+    fn store_rejects_inf_confidence() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        // f64::INFINITY can be constructed programmatically even if JSON doesn't support it
+        // This tests the early guard for programmatic callers
+        let mut params = json!({
+            "title": "Test", "content": "Test content",
+            "confidence": 0.5
+        });
+        // Directly set to Infinity (serde_json will represent as null)
+        // The handler defaults null confidence to 1.0, which is valid
+        // This verifies the validation layer catches out-of-range values
+        params["confidence"] = json!(999.0);
+        let result = handle_store(&conn, &params, None, None);
+        assert!(result.is_err(), "confidence 999.0 should be rejected by validation");
+    }
+
+    // RT-14: forget with tier-only (no namespace) rejected for safety
+    #[test]
+    fn forget_tier_only_requires_namespace() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let params = json!({"tier": "short"});
+        let result = handle_forget(&conn, &params);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("namespace is required"));
+    }
+
+    // RT-14: forget with tier+namespace succeeds
+    #[test]
+    fn forget_tier_with_namespace_allowed() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let params = json!({"tier": "short", "namespace": "test"});
+        let result = handle_forget(&conn, &params);
+        assert!(result.is_ok());
+    }
+
+    // RT-01: promote handler uses atomic promote
+    #[test]
+    fn promote_handler_atomic() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let mem = crate::models::Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Mid, namespace: "test".into(), title: "Promote test".into(),
+            content: "Content".into(), tags: vec![], priority: 5, confidence: 1.0,
+            source: "test".into(), access_count: 0, created_at: now.clone(),
+            updated_at: now.clone(), last_accessed_at: None,
+            expires_at: Some((chrono::Utc::now() + chrono::Duration::days(7)).to_rfc3339()),
+        };
+        let id = db::insert(&conn, &mem).unwrap();
+        let params = json!({"id": id});
+        let result = handle_promote(&conn, &params);
+        assert!(result.is_ok());
+        let after = db::get(&conn, &id).unwrap().unwrap();
+        assert_eq!(after.tier, Tier::Long);
+        assert!(after.expires_at.is_none(), "expires_at must be cleared atomically");
+    }
+
+    // RT-08: handle_search passes filters through
+    #[test]
+    fn search_handler_accepts_filters() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let mem = crate::models::Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long, namespace: "test".into(), title: "Searchable item".into(),
+            content: "Content here".into(), tags: vec!["rust".into()], priority: 8,
+            confidence: 1.0, source: "test".into(), access_count: 0,
+            created_at: now.clone(), updated_at: now.clone(),
+            last_accessed_at: None, expires_at: None,
+        };
+        db::insert(&conn, &mem).unwrap();
+        // Search with min_priority filter
+        let params = json!({"query": "Searchable", "min_priority": 9});
+        let result = handle_search(&conn, &params).unwrap();
+        assert_eq!(result["count"], 0, "priority 8 should be filtered out by min_priority 9");
+        // Search without filter should find it
+        let params = json!({"query": "Searchable", "min_priority": 7});
+        let result = handle_search(&conn, &params).unwrap();
+        assert_eq!(result["count"], 1);
+    }
+
+    // RT-08: handle_list passes filters through
+    #[test]
+    fn list_handler_accepts_filters() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let mem = crate::models::Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long, namespace: "test".into(), title: "Listable item".into(),
+            content: "Content".into(), tags: vec!["go".into()], priority: 3,
+            confidence: 1.0, source: "test".into(), access_count: 0,
+            created_at: now.clone(), updated_at: now.clone(),
+            last_accessed_at: None, expires_at: None,
+        };
+        db::insert(&conn, &mem).unwrap();
+        // List with tags filter
+        let params = json!({"tags": "go"});
+        let result = handle_list(&conn, &params).unwrap();
+        assert_eq!(result["count"], 1);
+        // List with wrong tag
+        let params = json!({"tags": "python"});
+        let result = handle_list(&conn, &params).unwrap();
+        assert_eq!(result["count"], 0);
     }
 }

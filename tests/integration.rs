@@ -2146,3 +2146,212 @@ fn test_mcp_recall_default_toon() {
 
     let _ = std::fs::remove_file(&db_path);
 }
+
+// ---------------------------------------------------------------------------
+// Database path resolution & doctor subcommand tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_db_created_at_explicit_absolute_path() {
+    let dir = std::env::temp_dir();
+    let db_path = dir.join(format!("ai-memory-path-test-{}.db", uuid::Uuid::new_v4()));
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+
+    // Stats should create the DB at the explicit path
+    let output = cmd(binary)
+        .args(["--db", db_path.to_str().unwrap(), "stats"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stats failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(db_path.exists(), "database should exist at explicit path");
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_default_db_path_is_absolute() {
+    // When no --db flag is passed (and no config), the binary should use an absolute path.
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+    let tmpdir = std::env::temp_dir().join(format!("ai-memory-cwd-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&tmpdir).unwrap();
+
+    let output = cmd(binary)
+        .current_dir(&tmpdir)
+        .args(["--json", "stats"])
+        .output()
+        .unwrap();
+
+    // The old bug would create ai-memory.db in the CWD
+    let stray = tmpdir.join("ai-memory.db");
+    assert!(
+        !stray.exists(),
+        "ai-memory.db should NOT be created in CWD (old bug). Found: {}",
+        stray.display()
+    );
+
+    assert!(
+        output.status.success(),
+        "stats failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&tmpdir);
+}
+
+#[test]
+fn test_doctor_json_output() {
+    let dir = std::env::temp_dir();
+    let db_path = dir.join(format!("ai-memory-doctor-test-{}.db", uuid::Uuid::new_v4()));
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+
+    // Create the database first
+    let _ = cmd(binary)
+        .args(["--db", db_path.to_str().unwrap(), "stats"])
+        .output()
+        .unwrap();
+
+    // Run doctor with --json
+    let output = cmd(binary)
+        .args(["--db", db_path.to_str().unwrap(), "--json", "doctor"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "doctor failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(json["primary_db"].is_string());
+    assert!(json["primary_is_absolute"].is_boolean());
+    assert!(json["config_exists"].is_boolean());
+    assert!(json["databases_found"].is_array());
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_doctor_detects_stray_database() {
+    // Use a directory where the primary IS named ai-memory.db so doctor's scan finds it
+    let dir = std::env::temp_dir().join(format!("ai-memory-doctor-detect-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let primary = dir.join("ai-memory.db");
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+
+    // Create primary
+    let _ = cmd(binary)
+        .args([
+            "--db", primary.to_str().unwrap(),
+            "store", "-t", "long", "-T", "test mem", "--content", "test content",
+        ])
+        .output()
+        .unwrap();
+
+    // Run doctor scanning that directory
+    let output = cmd(binary)
+        .args([
+            "--db", primary.to_str().unwrap(),
+            "--json", "doctor",
+            "--scan-dir", dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let dbs = json["databases_found"].as_array().unwrap();
+    let has_primary = dbs.iter().any(|d| d["is_primary"].as_bool() == Some(true));
+    assert!(has_primary, "doctor should find the primary database");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_doctor_fix_merges_stray() {
+    let dir = std::env::temp_dir().join(format!("ai-memory-doctor-fix-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let primary = dir.join("primary.db");
+    let stray = dir.join("ai-memory.db");
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+
+    // Create primary with 1 memory
+    let _ = cmd(binary)
+        .args([
+            "--db", primary.to_str().unwrap(),
+            "store", "-t", "long", "-T", "primary mem", "--content", "primary",
+        ])
+        .output()
+        .unwrap();
+
+    // Create stray with a different memory
+    let _ = cmd(binary)
+        .args([
+            "--db", stray.to_str().unwrap(),
+            "store", "-t", "long", "-T", "stray mem", "--content", "stray data",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(stray.exists(), "stray should exist before fix");
+
+    // Run doctor --fix — override HOME to isolate from real DBs
+    let output = cmd(binary)
+        .env("HOME", dir.to_str().unwrap())
+        .args([
+            "--db", primary.to_str().unwrap(),
+            "doctor", "--fix",
+            "--scan-dir", dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "doctor --fix failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify stray was renamed
+    assert!(
+        !stray.exists(),
+        "stray should be renamed after merge"
+    );
+
+    // Verify primary now has 2 memories
+    let output = cmd(binary)
+        .args(["--db", primary.to_str().unwrap(), "--json", "stats"])
+        .output()
+        .unwrap();
+    let stats: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(stats["total"].as_u64().unwrap(), 2, "primary should have 2 memories after merge");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_tilde_expansion_in_db_flag() {
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let db_name = format!("ai-memory-tilde-test-{}.db", uuid::Uuid::new_v4());
+    let tilde_path = format!("~/{}", db_name);
+    let expected_path = format!("{}/{}", home, db_name);
+
+    let output = cmd(binary)
+        .args(["--db", &tilde_path, "--json", "stats"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stats with tilde path failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        std::path::Path::new(&expected_path).exists(),
+        "database should exist at expanded path: {}",
+        expected_path
+    );
+
+    let _ = std::fs::remove_file(&expected_path);
+}

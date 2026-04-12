@@ -26,7 +26,7 @@ use axum::{
     Router,
 };
 use chrono::{Duration, Utc};
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use clap_complete::{generate, Shell};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -37,7 +37,6 @@ use tracing_subscriber::EnvFilter;
 
 use crate::models::Tier;
 
-const DEFAULT_DB: &str = "ai-memory.db";
 const DEFAULT_PORT: u16 = 9077;
 const GC_INTERVAL_SECS: u64 = 1800;
 
@@ -60,7 +59,7 @@ fn id_short(id: &str) -> &str {
 struct Cli {
     #[command(subcommand)]
     command: Command,
-    #[arg(long, env = "AI_MEMORY_DB", default_value = DEFAULT_DB, global = true)]
+    #[arg(long, env = "AI_MEMORY_DB", default_value_os_t = config::default_db_path(), global = true)]
     db: PathBuf,
     /// Output as JSON (machine-parseable)
     #[arg(long, global = true, default_value_t = false)]
@@ -131,6 +130,8 @@ enum Command {
     Man,
     /// Import memories from historical conversations (Claude, ChatGPT, Slack exports)
     Mine(MineArgs),
+    /// Diagnose database issues: detect fragmented databases, config problems
+    Doctor(DoctorArgs),
 }
 
 #[derive(Args)]
@@ -354,6 +355,16 @@ struct CompletionsArgs {
     shell: Shell,
 }
 
+#[derive(Args)]
+struct DoctorArgs {
+    /// Automatically merge found fragments into the primary database
+    #[arg(long, default_value_t = false)]
+    fix: bool,
+    /// Additional directories to scan for stray databases
+    #[arg(long)]
+    scan_dir: Vec<PathBuf>,
+}
+
 fn auto_namespace() -> String {
     // Try git remote name
     if let Ok(out) = std::process::Command::new("git")
@@ -404,8 +415,13 @@ async fn main() -> Result<()> {
     color::init();
     let app_config = config::AppConfig::load();
     config::AppConfig::write_default_if_missing();
-    let cli = Cli::parse();
-    let db_path = app_config.effective_db(&cli.db);
+
+    // Parse CLI while retaining ArgMatches so we can detect explicit --db
+    let matches = Cli::command().get_matches();
+    let cli_db_explicit = matches.value_source("db")
+        == Some(clap::parser::ValueSource::CommandLine);
+    let cli = Cli::from_arg_matches(&matches)?;
+    let db_path = app_config.effective_db(&cli.db, cli_db_explicit);
     let j = cli.json;
     match cli.command {
         Command::Serve(a) => {
@@ -414,7 +430,17 @@ async fn main() -> Result<()> {
         }
         Command::Mcp { tier } => {
             app_config.warn_non_localhost_urls();
-            let feature_tier = app_config.effective_tier(Some(&tier));
+            // RT-17: detect if --tier was explicitly provided or is just the default.
+            // If not explicit, let config.toml tier be used via effective_tier(None).
+            let mcp_tier_explicit = matches
+                .subcommand_matches("mcp")
+                .and_then(|m| m.value_source("tier"))
+                == Some(clap::parser::ValueSource::CommandLine);
+            let feature_tier = if mcp_tier_explicit {
+                app_config.effective_tier(Some(&tier))
+            } else {
+                app_config.effective_tier(None)
+            };
             mcp::run_mcp_server(&db_path, feature_tier, &app_config)?;
             Ok(())
         }
@@ -454,6 +480,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Mine(a) => cmd_mine(db_path, a, j),
+        Command::Doctor(a) => cmd_doctor(db_path, a, j),
     }
 }
 
@@ -645,6 +672,8 @@ fn cmd_store(db_path: PathBuf, args: StoreArgs, json_out: bool) -> Result<()> {
     let contradictions =
         db::find_contradictions(&conn, &mem.title, &mem.namespace).unwrap_or_default();
     let actual_id = db::insert(&conn, &mem)?;
+    // RT-25: checkpoint WAL after write operation
+    let _ = db::checkpoint(&conn);
     if json_out {
         let mut j = serde_json::to_value(&mem)?;
         j["id"] = serde_json::json!(actual_id);
@@ -1044,27 +1073,14 @@ fn cmd_delete(db_path: PathBuf, args: DeleteArgs, json_out: bool) -> Result<()> 
 
 fn cmd_promote(db_path: PathBuf, args: PromoteArgs, json_out: bool) -> Result<()> {
     let conn = db::open(&db_path)?;
-    let updated = db::update(
-        &conn,
-        &args.id,
-        None,
-        None,
-        Some(&Tier::Long),
-        None,
-        None,
-        None,
-        None,
-        Some(""),
-    )?;
+    // RT-01: use atomic promote (tier + expiry in single transaction)
+    let updated = db::promote(&conn, &args.id)?;
     if !updated {
         eprintln!("not found: {}", args.id);
         std::process::exit(1);
     }
-    // Clear expires_at for long-term
-    conn.execute(
-        "UPDATE memories SET expires_at = NULL WHERE id = ?1",
-        rusqlite::params![args.id],
-    )?;
+    // RT-25: checkpoint WAL after write operation
+    let _ = db::checkpoint(&conn);
     if json_out {
         println!(
             "{}",
@@ -1134,6 +1150,8 @@ fn cmd_consolidate(db_path: PathBuf, args: ConsolidateArgs, json_out: bool) -> R
         &Tier::Long,
         "cli",
     )?;
+    // RT-25: checkpoint WAL after write operation
+    let _ = db::checkpoint(&conn);
     if json_out {
         println!(
             "{}",
@@ -1148,6 +1166,8 @@ fn cmd_consolidate(db_path: PathBuf, args: ConsolidateArgs, json_out: bool) -> R
 fn cmd_gc(db_path: PathBuf, json_out: bool) -> Result<()> {
     let conn = db::open(&db_path)?;
     let count = db::gc(&conn)?;
+    // RT-25: checkpoint WAL after GC deletes
+    let _ = db::checkpoint(&conn);
     if json_out {
         println!("{}", serde_json::json!({"expired_deleted": count}));
     } else {
@@ -1795,9 +1815,10 @@ fn cmd_mine(db_path: PathBuf, args: MineArgs, json_out: bool) -> Result<()> {
     let mut skipped = 0usize;
     let mut errors = 0usize;
 
-    // Use a transaction for bulk performance, with proper rollback on error
+    // Use a single outer transaction for bulk performance (RT-21 fix).
+    // insert_no_tx is used instead of insert to avoid nested BEGIN.
     let result: Result<()> = (|| {
-        conn.execute_batch("BEGIN")?;
+        conn.execute_batch("BEGIN IMMEDIATE")?;
 
         for conv in &filtered {
             let mined = match mine::conversation_to_memory(conv, format) {
@@ -1829,7 +1850,7 @@ fn cmd_mine(db_path: PathBuf, args: MineArgs, json_out: bool) -> Result<()> {
                 expires_at,
             };
 
-            match db::insert(&conn, &mem) {
+            match db::insert_no_tx(&conn, &mem) {
                 Ok(_) => imported += 1,
                 Err(e) => {
                     errors += 1;
@@ -1840,7 +1861,7 @@ fn cmd_mine(db_path: PathBuf, args: MineArgs, json_out: bool) -> Result<()> {
             // Commit in batches of 100
             if imported.is_multiple_of(100) && imported > 0 {
                 conn.execute_batch("COMMIT")?;
-                conn.execute_batch("BEGIN")?;
+                conn.execute_batch("BEGIN IMMEDIATE")?;
             }
         }
 
@@ -1874,6 +1895,229 @@ fn cmd_mine(db_path: PathBuf, args: MineArgs, json_out: bool) -> Result<()> {
             errors
         );
         println!("Namespace: {}, Tier: {}", namespace, tier);
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// doctor — diagnose database fragmentation & config issues
+// ---------------------------------------------------------------------------
+
+fn cmd_doctor(db_path: PathBuf, args: DoctorArgs, json_out: bool) -> Result<()> {
+    let mut scan_dirs: Vec<PathBuf> = Vec::new();
+
+    // Standard locations to scan
+    if let Ok(home) = std::env::var("HOME") {
+        let h = PathBuf::from(&home);
+        scan_dirs.push(h.clone());
+        scan_dirs.push(h.join(".claude"));
+        scan_dirs.push(h.join(".local/share/ai-memory"));
+        scan_dirs.push(h.join(".config/ai-memory"));
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        scan_dirs.push(cwd);
+    }
+    // User-supplied extra directories
+    scan_dirs.extend(args.scan_dir.iter().cloned());
+    scan_dirs.sort();
+    scan_dirs.dedup();
+
+    let db_names = ["ai-memory.db", "claude-memory.db", "memory.db"];
+
+    #[derive(serde::Serialize)]
+    struct StrayDb {
+        path: String,
+        memories: i64,
+        size_bytes: u64,
+        is_primary: bool,
+    }
+
+    let mut strays: Vec<StrayDb> = Vec::new();
+    let primary_canonical = std::fs::canonicalize(&db_path)
+        .unwrap_or_else(|_| db_path.clone());
+
+    for dir in &scan_dirs {
+        for name in &db_names {
+            let candidate = dir.join(name);
+            if !candidate.is_file() {
+                continue;
+            }
+            let candidate_canonical = std::fs::canonicalize(&candidate)
+                .unwrap_or_else(|_| candidate.clone());
+            let is_primary = candidate_canonical == primary_canonical;
+            let size = std::fs::metadata(&candidate)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let memories = match db::open(&candidate) {
+                Ok(conn) => db::stats(&conn, &candidate)
+                    .map(|s| s.total as i64)
+                    .unwrap_or(-1),
+                Err(_) => -1,
+            };
+            strays.push(StrayDb {
+                path: candidate.display().to_string(),
+                memories,
+                size_bytes: size,
+                is_primary,
+            });
+        }
+    }
+
+    // Config diagnosis
+    let config_path = config::AppConfig::config_path();
+    let config_exists = config_path.as_ref().is_some_and(|p| p.exists());
+    let config_has_db = config::AppConfig::load().db.is_some();
+    let effective_is_absolute = db_path.is_absolute();
+
+    if json_out {
+        let report = serde_json::json!({
+            "primary_db": db_path.display().to_string(),
+            "primary_is_absolute": effective_is_absolute,
+            "config_exists": config_exists,
+            "config_has_db_key": config_has_db,
+            "databases_found": strays,
+        });
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("ai-memory doctor");
+        println!("================\n");
+        println!("Primary database: {}", db_path.display());
+        println!(
+            "Path type: {}",
+            if effective_is_absolute {
+                "absolute (good)"
+            } else {
+                "RELATIVE (fragmentation risk!)"
+            }
+        );
+        println!(
+            "Config file: {}",
+            config_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "not found".to_string())
+        );
+        println!("Config exists: {}", config_exists);
+        println!("Config has db key: {}", config_has_db);
+
+        println!("\nDatabases found:");
+        println!("{:<60} {:>8} {:>12} ", "PATH", "MEMORIES", "SIZE");
+        for s in &strays {
+            println!(
+                "{:<60} {:>8} {:>10}KB {}",
+                s.path,
+                if s.memories >= 0 {
+                    s.memories.to_string()
+                } else {
+                    "ERR".to_string()
+                },
+                s.size_bytes / 1024,
+                if s.is_primary { "<-- PRIMARY" } else { "" }
+            );
+        }
+
+        let non_primary_with_data: Vec<&StrayDb> = strays
+            .iter()
+            .filter(|s| !s.is_primary && s.memories > 0)
+            .collect();
+
+        if non_primary_with_data.is_empty() {
+            println!("\nNo stray databases with data found. All clear.");
+        } else {
+            println!(
+                "\n{} stray database(s) with data found.",
+                non_primary_with_data.len()
+            );
+            if !args.fix {
+                println!("Run `ai-memory doctor --fix` to merge them into the primary database.");
+            }
+        }
+    }
+
+    // --fix: merge strays into primary
+    if args.fix {
+        if !json_out {
+            eprintln!(
+                "WARNING: ensure no MCP server or other ai-memory process is running \
+                 against the primary database during merge."
+            );
+        }
+        let primary_conn = db::open(&db_path)?;
+        let mut total_merged = 0usize;
+        for s in &strays {
+            if s.is_primary || s.memories <= 0 {
+                continue;
+            }
+            let stray_path = PathBuf::from(&s.path);
+            let stray_conn = match db::open(&stray_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("  skip {}: {}", s.path, e);
+                    continue;
+                }
+            };
+
+            // Validate remote has memories table
+            let has_table: i64 = stray_conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='memories'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if has_table == 0 {
+                continue;
+            }
+
+            let mems = db::export_all(&stray_conn)?;
+            let links = db::export_links(&stray_conn)?;
+            let mut n = 0usize;
+            for mem in &mems {
+                if validate::validate_memory(mem).is_err() {
+                    continue;
+                }
+                if db::insert(&primary_conn, mem).is_ok() {
+                    n += 1;
+                }
+            }
+            for link in &links {
+                if validate::validate_link(&link.source_id, &link.target_id, &link.relation)
+                    .is_ok()
+                {
+                    let _ = db::create_link(
+                        &primary_conn,
+                        &link.source_id,
+                        &link.target_id,
+                        &link.relation,
+                    );
+                }
+            }
+
+            if n > 0 {
+                // Rename stray to prevent re-merge
+                let backup_name = format!(
+                    "{}.merged-{}",
+                    s.path,
+                    chrono::Utc::now().format("%Y%m%d")
+                );
+                let _ = std::fs::rename(&stray_path, &backup_name);
+                if !json_out {
+                    println!(
+                        "  merged {} memories from {} → renamed to {}",
+                        n, s.path, backup_name
+                    );
+                }
+            }
+            total_merged += n;
+        }
+        if json_out {
+            println!("{}", serde_json::json!({"merged": total_merged}));
+        } else if total_merged > 0 {
+            println!("\nTotal merged: {} memories", total_merged);
+        } else {
+            println!("\nNothing to merge.");
+        }
     }
 
     Ok(())

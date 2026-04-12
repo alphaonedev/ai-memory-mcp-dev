@@ -9,6 +9,7 @@ use std::path::Path;
 use crate::fts;
 use crate::models::*;
 use crate::scoring;
+use crate::validate;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS memories (
@@ -186,44 +187,48 @@ fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
     })
 }
 
-/// Insert with upsert on title+namespace. Returns the ID (existing or new).
-pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
+/// Insert core logic without transaction management.
+/// Call this within an externally managed transaction (e.g., bulk import).
+/// Strips invisible Unicode from title and content before storage (RT-10).
+pub(crate) fn insert_no_tx(conn: &Connection, mem: &Memory) -> Result<String> {
     let tags_json = serde_json::to_string(&mem.tags)?;
+    let clean_title = validate::strip_invisible(&mem.title);
+    let clean_content = validate::strip_invisible(&mem.content);
+    conn.execute(
+        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+         ON CONFLICT(title, namespace) DO UPDATE SET
+            content = excluded.content,
+            tags = excluded.tags,
+            priority = MAX(memories.priority, excluded.priority),
+            confidence = MAX(memories.confidence, excluded.confidence),
+            source = excluded.source,
+            tier = CASE WHEN excluded.tier = 'long' THEN 'long'
+                        WHEN memories.tier = 'long' THEN 'long'
+                        WHEN excluded.tier = 'mid' THEN 'mid'
+                        ELSE memories.tier END,
+            updated_at = excluded.updated_at,
+            expires_at = CASE WHEN excluded.tier = 'long' OR memories.tier = 'long' THEN NULL
+                              ELSE COALESCE(excluded.expires_at, memories.expires_at) END",
+        params![
+            mem.id, mem.tier.as_str(), mem.namespace, clean_title, clean_content,
+            tags_json, mem.priority, mem.confidence, mem.source, mem.access_count,
+            mem.created_at, mem.updated_at, mem.last_accessed_at, mem.expires_at,
+        ],
+    )?;
+    let actual_id: String = conn.query_row(
+        "SELECT id FROM memories WHERE title = ?1 AND namespace = ?2",
+        params![clean_title, mem.namespace],
+        |r| r.get(0),
+    )?;
+    Ok(actual_id)
+}
 
+/// Insert with upsert on title+namespace. Returns the ID (existing or new).
+/// Wraps [`insert_no_tx`] in its own transaction.
+pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
-
-    let result = (|| -> Result<String> {
-        conn.execute(
-            "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
-             ON CONFLICT(title, namespace) DO UPDATE SET
-                content = excluded.content,
-                tags = excluded.tags,
-                priority = MAX(memories.priority, excluded.priority),
-                confidence = MAX(memories.confidence, excluded.confidence),
-                source = excluded.source,
-                tier = CASE WHEN excluded.tier = 'long' THEN 'long'
-                            WHEN memories.tier = 'long' THEN 'long'
-                            WHEN excluded.tier = 'mid' THEN 'mid'
-                            ELSE memories.tier END,
-                updated_at = excluded.updated_at,
-                expires_at = CASE WHEN excluded.tier = 'long' OR memories.tier = 'long' THEN NULL
-                                  ELSE COALESCE(excluded.expires_at, memories.expires_at) END",
-            params![
-                mem.id, mem.tier.as_str(), mem.namespace, mem.title, mem.content,
-                tags_json, mem.priority, mem.confidence, mem.source, mem.access_count,
-                mem.created_at, mem.updated_at, mem.last_accessed_at, mem.expires_at,
-            ],
-        )?;
-        // Return the actual ID (could be the existing one on conflict)
-        let actual_id: String = conn.query_row(
-            "SELECT id FROM memories WHERE title = ?1 AND namespace = ?2",
-            params![mem.title, mem.namespace],
-            |r| r.get(0),
-        )?;
-        Ok(actual_id)
-    })();
-
+    let result = insert_no_tx(conn, mem);
     match result {
         Ok(id) => {
             conn.execute_batch("COMMIT")?;
@@ -326,8 +331,14 @@ pub fn update(
         drop(rows);
         drop(stmt);
 
-        let title = title.unwrap_or(&existing.title);
-        let content = content.unwrap_or(&existing.content);
+        // RT-10: strip invisible unicode from title/content on update
+        let new_title = title.map(validate::strip_invisible);
+        let new_content = content.map(validate::strip_invisible);
+        let title_val = new_title.as_deref().unwrap_or(&existing.title);
+        let content_val = new_content.as_deref().unwrap_or(&existing.content);
+        // RT-07: track if content changed so we can invalidate embedding
+        let content_changed = title.is_some() && title_val != existing.title
+            || content.is_some() && content_val != existing.content;
         let tier = tier.unwrap_or(&existing.tier);
         let namespace = namespace.unwrap_or(&existing.namespace);
         let tags = tags.unwrap_or(&existing.tags);
@@ -345,8 +356,15 @@ pub fn update(
         conn.execute(
             "UPDATE memories SET tier=?1, namespace=?2, title=?3, content=?4, tags=?5, priority=?6, confidence=?7, updated_at=?8, expires_at=?9
              WHERE id=?10",
-            params![tier.as_str(), namespace, title, content, tags_json, priority, confidence, now, expires_at, id],
+            params![tier.as_str(), namespace, title_val, content_val, tags_json, priority, confidence, now, expires_at, id],
         )?;
+        // RT-07: invalidate embedding when content changes so it gets re-embedded
+        if content_changed {
+            conn.execute(
+                "UPDATE memories SET embedding = NULL WHERE id = ?1",
+                params![id],
+            )?;
+        }
         Ok(true)
     })();
 
@@ -405,6 +423,15 @@ pub fn forget(
     Ok(deleted)
 }
 
+/// Convert a comma-separated tags string to a JSON array for SQL matching.
+/// RT-24: this ensures "rust,python" matches memories with either tag.
+fn tags_to_json_array(tags: Option<&str>) -> Option<String> {
+    tags.map(|t| {
+        let arr: Vec<&str> = t.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string())
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn list(
     conn: &Connection,
@@ -420,6 +447,7 @@ pub fn list(
     let limit = limit.min(10_000);
     let now = Utc::now().to_rfc3339();
     let tier_str = tier.map(|t| t.as_str().to_string());
+    let tags_json = tags_to_json_array(tags_filter);
     let mut stmt = conn.prepare(
         "SELECT * FROM memories
          WHERE (?1 IS NULL OR namespace = ?1)
@@ -428,7 +456,9 @@ pub fn list(
            AND (expires_at IS NULL OR expires_at > ?4)
            AND (?5 IS NULL OR created_at >= ?5)
            AND (?6 IS NULL OR created_at <= ?6)
-           AND (?7 IS NULL OR EXISTS (SELECT 1 FROM json_each(memories.tags) WHERE json_each.value = ?7))
+           AND (?7 IS NULL OR EXISTS (
+               SELECT 1 FROM json_each(memories.tags) AS mt, json_each(?7) AS ft
+               WHERE mt.value = ft.value))
          ORDER BY priority DESC, updated_at DESC
          LIMIT ?8 OFFSET ?9",
     )?;
@@ -440,7 +470,7 @@ pub fn list(
             now,
             since,
             until,
-            tags_filter,
+            tags_json,
             limit as i64,
             offset as i64
         ],
@@ -466,6 +496,7 @@ pub fn search(
     let now = Utc::now().to_rfc3339();
     let tier_str = tier.map(|t| t.as_str().to_string());
     let fts_query = fts::sanitize_fts5_query(query, false);
+    let tags_json = tags_to_json_array(tags_filter);
 
     // Over-fetch by 3× so Rust-side re-scoring can reorder accurately.
     let fetch_limit = (limit * 3).max(30) as i64;
@@ -483,7 +514,9 @@ pub fn search(
            AND (m.expires_at IS NULL OR m.expires_at > ?5)
            AND (?6 IS NULL OR m.created_at >= ?6)
            AND (?7 IS NULL OR m.created_at <= ?7)
-           AND (?8 IS NULL OR EXISTS (SELECT 1 FROM json_each(m.tags) WHERE json_each.value = ?8))
+           AND (?8 IS NULL OR EXISTS (
+               SELECT 1 FROM json_each(m.tags) AS mt, json_each(?8) AS ft
+               WHERE mt.value = ft.value))
          ORDER BY fts.rank
          LIMIT ?9",
     )?;
@@ -496,7 +529,7 @@ pub fn search(
             now,
             since,
             until,
-            tags_filter,
+            tags_json,
             fetch_limit,
         ],
         |row| {
@@ -545,6 +578,7 @@ pub fn recall(
     let limit = limit.min(10_000);
     let now = Utc::now().to_rfc3339();
     let fts_query = fts::sanitize_fts5_query(context, true);
+    let tags_json = tags_to_json_array(tags_filter);
 
     // Over-fetch by 3× so Rust-side re-scoring can reorder accurately.
     let fetch_limit = (limit * 3).max(30) as i64;
@@ -558,7 +592,9 @@ pub fn recall(
          WHERE memories_fts MATCH ?1
            AND (?2 IS NULL OR m.namespace = ?2)
            AND (m.expires_at IS NULL OR m.expires_at > ?3)
-           AND (?4 IS NULL OR EXISTS (SELECT 1 FROM json_each(m.tags) WHERE json_each.value = ?4))
+           AND (?4 IS NULL OR EXISTS (
+               SELECT 1 FROM json_each(m.tags) AS mt, json_each(?4) AS ft
+               WHERE mt.value = ft.value))
            AND (?5 IS NULL OR m.created_at >= ?5)
            AND (?6 IS NULL OR m.created_at <= ?6)
          ORDER BY fts.rank
@@ -569,7 +605,7 @@ pub fn recall(
             fts_query,
             namespace,
             now,
-            tags_filter,
+            tags_json,
             since,
             until,
             fetch_limit,
@@ -640,6 +676,27 @@ pub fn create_link(
     target_id: &str,
     relation: &str,
 ) -> Result<()> {
+    // RT-02: verify both IDs exist before inserting to give clear errors
+    let source_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)",
+            params![source_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    if !source_exists {
+        anyhow::bail!("source memory not found: {}", source_id);
+    }
+    let target_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)",
+            params![target_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    if !target_exists {
+        anyhow::bail!("target memory not found: {}", target_id);
+    }
     let now = Utc::now().to_rfc3339();
     conn.execute(
         "INSERT OR IGNORE INTO memory_links (source_id, target_id, relation, created_at) VALUES (?1, ?2, ?3, ?4)",
@@ -859,9 +916,13 @@ pub fn gc(conn: &Connection) -> Result<usize> {
     Ok(deleted)
 }
 
+/// Export all non-expired memories (RT-16: excludes expired to prevent resurrection on import).
 pub fn export_all(conn: &Connection) -> Result<Vec<Memory>> {
-    let mut stmt = conn.prepare("SELECT * FROM memories ORDER BY created_at ASC")?;
-    let rows = stmt.query_map([], row_to_memory)?;
+    let now = Utc::now().to_rfc3339();
+    let mut stmt = conn.prepare(
+        "SELECT * FROM memories WHERE expires_at IS NULL OR expires_at > ?1 ORDER BY created_at ASC",
+    )?;
+    let rows = stmt.query_map(params![now], row_to_memory)?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Into::into)
 }
@@ -943,6 +1004,16 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
 /// `embedding` column is not indexed by FTS5. A future migration should either
 /// use a conditional trigger (`WHEN OLD.title != NEW.title OR ...`) or move
 /// embeddings to a separate table to avoid the unnecessary FTS rebuild.
+/// Clear the embedding for a memory so it gets re-embedded on next backfill (RT-07).
+#[allow(dead_code)]
+pub fn clear_embedding(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE memories SET embedding = NULL WHERE id = ?1",
+        params![id],
+    )?;
+    Ok(())
+}
+
 pub fn set_embedding(conn: &Connection, id: &str, embedding: &[f32]) -> Result<()> {
     let bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
     conn.execute(
@@ -1033,6 +1104,7 @@ pub fn recall_hybrid(
     let limit = limit.min(10_000);
     let now = Utc::now().to_rfc3339();
     let fts_query = fts::sanitize_fts5_query(context, true);
+    let tags_json = tags_to_json_array(tags_filter);
 
     // Step 1: Get FTS candidates (up to 3x limit to have a good pool)
     let fts_limit = (limit * 3).max(30);
@@ -1046,7 +1118,9 @@ pub fn recall_hybrid(
          WHERE memories_fts MATCH ?1
            AND (?2 IS NULL OR m.namespace = ?2)
            AND (m.expires_at IS NULL OR m.expires_at > ?3)
-           AND (?4 IS NULL OR EXISTS (SELECT 1 FROM json_each(m.tags) WHERE json_each.value = ?4))
+           AND (?4 IS NULL OR EXISTS (
+               SELECT 1 FROM json_each(m.tags) AS mt, json_each(?4) AS ft
+               WHERE mt.value = ft.value))
            AND (?5 IS NULL OR m.created_at >= ?5)
            AND (?6 IS NULL OR m.created_at <= ?6)
          ORDER BY fts.rank
@@ -1062,7 +1136,9 @@ pub fn recall_hybrid(
          WHERE embedding IS NOT NULL
            AND (?1 IS NULL OR namespace = ?1)
            AND (expires_at IS NULL OR expires_at > ?2)
-           AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(memories.tags) WHERE json_each.value = ?3))
+           AND (?3 IS NULL OR EXISTS (
+               SELECT 1 FROM json_each(memories.tags) AS mt, json_each(?3) AS ft
+               WHERE mt.value = ft.value))
            AND (?4 IS NULL OR created_at >= ?4)
            AND (?5 IS NULL OR created_at <= ?5)",
     )?;
@@ -1077,7 +1153,7 @@ pub fn recall_hybrid(
             fts_query,
             namespace,
             now,
-            tags_filter,
+            tags_json,
             since,
             until,
             fts_limit as i64
@@ -1136,7 +1212,8 @@ pub fn recall_hybrid(
                         }
                     }
                     if let Some(tf) = tags_filter {
-                        if !mem.tags.iter().any(|t| t == tf) {
+                        let filter_tags: Vec<&str> = tf.split(',').map(|s| s.trim()).collect();
+                        if !mem.tags.iter().any(|t| filter_tags.contains(&t.as_str())) {
                             continue;
                         }
                     }
@@ -1157,7 +1234,7 @@ pub fn recall_hybrid(
     } else {
         // Fallback: linear scan over all embeddings
         let sem_rows =
-            sem_stmt.query_map(params![namespace, now, tags_filter, since, until], |row| {
+            sem_stmt.query_map(params![namespace, now, tags_json, since, until], |row| {
                 let mem = row_to_memory(row)?;
                 let emb_bytes: Option<Vec<u8>> = row.get(14)?;
                 Ok((mem, emb_bytes))
@@ -1210,6 +1287,50 @@ pub fn recall_hybrid(
     }
 
     Ok(results)
+}
+
+/// RT-01: Atomic promote — sets tier=long and clears expires_at in a single transaction.
+/// Prevents crash-between-steps data loss where tier is updated but expiry is not cleared.
+pub fn promote(conn: &Connection, id: &str) -> Result<bool> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<bool> {
+        let changed = conn.execute(
+            "UPDATE memories SET tier = 'long', expires_at = NULL, updated_at = ?1 WHERE id = ?2",
+            params![Utc::now().to_rfc3339(), id],
+        )?;
+        Ok(changed > 0)
+    })();
+    match result {
+        Ok(val) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(val)
+        }
+        Err(e) => {
+            if let Err(rb) = conn.execute_batch("ROLLBACK") {
+                tracing::error!("ROLLBACK failed in promote: {}", rb);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// RT-12: Bulk insert within a single transaction — atomic all-or-nothing.
+/// Returns (success_count, errors). On any DB error the entire batch is rolled back.
+pub fn bulk_insert_atomic(
+    conn: &Connection,
+    memories: &[Memory],
+) -> Result<(usize, Vec<String>)> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let mut count = 0usize;
+    let mut errors = Vec::new();
+    for mem in memories {
+        match insert_no_tx(conn, mem) {
+            Ok(_) => count += 1,
+            Err(e) => errors.push(format!("{}: {}", mem.id, e)),
+        }
+    }
+    conn.execute_batch("COMMIT")?;
+    Ok((count, errors))
 }
 
 /// Checkpoint WAL for clean shutdown.
@@ -1853,5 +1974,171 @@ mod tests {
         insert(&conn, &make_memory("Drop test beta", "test", Tier::Long, 5)).unwrap();
         let results = search(&conn, "Drop test", None, None, 10, None, None, None, None).unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    // --- Red Team Phase 2 tests ---
+
+    // RT-21: insert_no_tx works within external transaction
+    #[test]
+    fn insert_no_tx_within_transaction() {
+        let conn = test_db();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let m1 = make_memory("Batch 1", "test", Tier::Long, 5);
+        let m2 = make_memory("Batch 2", "test", Tier::Long, 5);
+        insert_no_tx(&conn, &m1).unwrap();
+        insert_no_tx(&conn, &m2).unwrap();
+        conn.execute_batch("COMMIT").unwrap();
+        let results = list(&conn, None, None, 100, 0, None, None, None, None).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    // RT-02: create_link rejects nonexistent IDs
+    #[test]
+    fn create_link_rejects_nonexistent_source() {
+        let conn = test_db();
+        let mem = make_memory("Target", "test", Tier::Long, 5);
+        let id = insert(&conn, &mem).unwrap();
+        let result = create_link(&conn, "nonexistent", &id, "related_to");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("source memory not found"));
+    }
+
+    #[test]
+    fn create_link_rejects_nonexistent_target() {
+        let conn = test_db();
+        let mem = make_memory("Source", "test", Tier::Long, 5);
+        let id = insert(&conn, &mem).unwrap();
+        let result = create_link(&conn, &id, "nonexistent", "related_to");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("target memory not found"));
+    }
+
+    // RT-07: update invalidates embedding when content changes
+    #[test]
+    fn update_clears_embedding_on_content_change() {
+        let conn = test_db();
+        let mem = make_memory("Embed test", "test", Tier::Long, 5);
+        let id = insert(&conn, &mem).unwrap();
+        // Set a fake embedding
+        set_embedding(&conn, &id, &[0.1, 0.2, 0.3]).unwrap();
+        assert!(get_embedding(&conn, &id).unwrap().is_some());
+        // Update content
+        update(&conn, &id, None, Some("new content"), None, None, None, None, None, None).unwrap();
+        // Embedding should be cleared
+        assert!(get_embedding(&conn, &id).unwrap().is_none());
+    }
+
+    #[test]
+    fn update_preserves_embedding_when_content_unchanged() {
+        let conn = test_db();
+        let mem = make_memory("Embed keep", "test", Tier::Long, 5);
+        let id = insert(&conn, &mem).unwrap();
+        set_embedding(&conn, &id, &[0.1, 0.2, 0.3]).unwrap();
+        // Update only priority (not content)
+        update(&conn, &id, None, None, None, None, None, Some(9), None, None).unwrap();
+        // Embedding should be preserved
+        assert!(get_embedding(&conn, &id).unwrap().is_some());
+    }
+
+    // RT-10: invisible unicode stripped from stored content
+    #[test]
+    fn insert_strips_invisible_unicode() {
+        let conn = test_db();
+        let mut mem = make_memory("test", "test", Tier::Long, 5);
+        mem.title = "Post\u{200B}greSQL config".to_string();
+        mem.content = "zero\u{200D}width content".to_string();
+        insert(&conn, &mem).unwrap();
+        let stored = get(&conn, &mem.id).unwrap().unwrap();
+        assert_eq!(stored.title, "PostgreSQL config");
+        assert_eq!(stored.content, "zerowidth content");
+    }
+
+    // RT-24: comma-separated tags filter
+    #[test]
+    fn list_with_comma_tags_filter() {
+        let conn = test_db();
+        let mut m1 = make_memory("Rust project", "test", Tier::Long, 5);
+        m1.tags = vec!["rust".to_string()];
+        let mut m2 = make_memory("Python project", "test", Tier::Long, 5);
+        m2.tags = vec!["python".to_string()];
+        let mut m3 = make_memory("Go project", "test", Tier::Long, 5);
+        m3.tags = vec!["go".to_string()];
+        insert(&conn, &m1).unwrap();
+        insert(&conn, &m2).unwrap();
+        insert(&conn, &m3).unwrap();
+        // Single tag
+        let r = list(&conn, None, None, 100, 0, None, None, None, Some("rust")).unwrap();
+        assert_eq!(r.len(), 1);
+        // Comma-separated should match both
+        let r = list(&conn, None, None, 100, 0, None, None, None, Some("rust,python")).unwrap();
+        assert_eq!(r.len(), 2);
+    }
+
+    // RT-01: atomic promote sets tier and clears expiry in one transaction
+    #[test]
+    fn promote_atomic_tier_and_expiry() {
+        let conn = test_db();
+        let mut mem = make_memory("Promote test", "test", Tier::Mid, 5);
+        mem.expires_at = Some(
+            (chrono::Utc::now() + chrono::Duration::days(7)).to_rfc3339(),
+        );
+        let id = insert(&conn, &mem).unwrap();
+        // Verify pre-state
+        let before = get(&conn, &id).unwrap().unwrap();
+        assert_eq!(before.tier, Tier::Mid);
+        assert!(before.expires_at.is_some());
+        // Promote
+        let result = promote(&conn, &id).unwrap();
+        assert!(result);
+        // Verify post-state
+        let after = get(&conn, &id).unwrap().unwrap();
+        assert_eq!(after.tier, Tier::Long);
+        assert!(after.expires_at.is_none(), "expires_at should be cleared");
+    }
+
+    #[test]
+    fn promote_nonexistent_returns_false() {
+        let conn = test_db();
+        let result = promote(&conn, "nonexistent-id").unwrap();
+        assert!(!result);
+    }
+
+    // RT-12: bulk_insert_atomic — all-or-nothing
+    #[test]
+    fn bulk_insert_atomic_all_succeed() {
+        let conn = test_db();
+        let mems = vec![
+            make_memory("Bulk 1", "test", Tier::Long, 5),
+            make_memory("Bulk 2", "test", Tier::Long, 5),
+            make_memory("Bulk 3", "test", Tier::Long, 5),
+        ];
+        let (count, errors) = bulk_insert_atomic(&conn, &mems).unwrap();
+        assert_eq!(count, 3);
+        assert!(errors.is_empty());
+        let all = list(&conn, None, None, 100, 0, None, None, None, None).unwrap();
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn bulk_insert_atomic_empty() {
+        let conn = test_db();
+        let (count, errors) = bulk_insert_atomic(&conn, &[]).unwrap();
+        assert_eq!(count, 0);
+        assert!(errors.is_empty());
+    }
+
+    // RT-16: export_all excludes expired memories
+    #[test]
+    fn export_excludes_expired() {
+        let conn = test_db();
+        let mut mem = make_memory("Expired mem", "test", Tier::Short, 5);
+        mem.expires_at = Some("2020-01-01T00:00:00Z".to_string());
+        insert(&conn, &mem).unwrap();
+        let mut live = make_memory("Live mem", "test", Tier::Long, 5);
+        live.expires_at = None;
+        insert(&conn, &live).unwrap();
+        let exported = export_all(&conn).unwrap();
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0].title, "Live mem");
     }
 }

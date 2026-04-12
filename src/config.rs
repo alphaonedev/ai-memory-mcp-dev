@@ -261,6 +261,103 @@ pub struct CapabilityModels {
 const CONFIG_DIR: &str = ".config/ai-memory";
 const CONFIG_FILE: &str = "config.toml";
 
+// ---------------------------------------------------------------------------
+// Database path resolution
+// ---------------------------------------------------------------------------
+
+/// Compute the platform-appropriate default absolute path for the database.
+///
+/// Resolution order:
+/// 1. `$XDG_DATA_HOME/ai-memory/ai-memory.db` (if `XDG_DATA_HOME` is set)
+/// 2. `$HOME/.local/share/ai-memory/ai-memory.db`
+/// 3. Falls back to `ai-memory.db` only if `HOME` cannot be determined
+pub fn default_db_path() -> PathBuf {
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        if !xdg.is_empty() {
+            return PathBuf::from(xdg).join("ai-memory").join("ai-memory.db");
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            return PathBuf::from(&home)
+                .join(".local/share/ai-memory")
+                .join("ai-memory.db");
+        }
+    }
+    // Windows fallback
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        if !profile.is_empty() {
+            return PathBuf::from(&profile)
+                .join(".local/share/ai-memory")
+                .join("ai-memory.db");
+        }
+    }
+    // Last resort — preserves old behaviour but should never happen on a sane OS
+    PathBuf::from("ai-memory.db")
+}
+
+/// Expand a leading `~` or `~user` to the home directory and canonicalise.
+///
+/// Returns the path unchanged if it does not start with `~`.
+/// Logs a warning (but does **not** error) if the resolved path is relative,
+/// because a relative database path causes silent fragmentation.
+pub fn resolve_db_path(raw: &Path) -> PathBuf {
+    let expanded = expand_tilde(raw);
+    if expanded.is_relative() {
+        tracing::warn!(
+            "ai-memory: database path '{}' is relative — this may cause fragmentation across \
+             working directories. Set an absolute path in config.toml or via --db.",
+            expanded.display()
+        );
+    }
+    expanded
+}
+
+/// Pure tilde-expansion helper: `~/foo` → `$HOME/foo`, `~` → `$HOME`.
+fn expand_tilde(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    if !s.starts_with('~') {
+        return p.to_path_buf();
+    }
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default();
+    if home.is_empty() {
+        return p.to_path_buf();
+    }
+    if s == "~" {
+        return PathBuf::from(&home);
+    }
+    if let Some(rest) = s.strip_prefix("~/") {
+        return PathBuf::from(&home).join(rest);
+    }
+    // ~otheruser — not expanded (we only handle current user)
+    p.to_path_buf()
+}
+
+/// Ensure the parent directory of the database file exists.
+/// Creates with mode 0700 on Unix to prevent other users reading memory data.
+/// Returns an error only if the directory cannot be created.
+pub fn ensure_db_parent(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(parent)?;
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Persistent configuration loaded from `~/.config/ai-memory/config.toml`.
 ///
 /// All fields are optional — CLI flags override file values, which override
@@ -338,18 +435,39 @@ impl AppConfig {
         }
     }
 
-    /// Resolve the effective database path (CLI flag overrides config).
-    pub fn effective_db(&self, cli_db: &Path) -> PathBuf {
-        // If CLI provided a non-default path, use it
-        let default_db = PathBuf::from("ai-memory.db");
-        if cli_db != default_db {
-            return cli_db.to_path_buf();
+    /// Resolve the effective database path.
+    ///
+    /// Priority (highest wins):
+    /// 1. `--db` explicitly passed on the command line (`cli_explicit == true`)
+    /// 2. `db` key in `config.toml`
+    /// 3. XDG-compliant default (`~/.local/share/ai-memory/ai-memory.db`)
+    ///
+    /// All paths are run through [`resolve_db_path`] for tilde expansion and
+    /// relative-path warnings.  The parent directory is created automatically.
+    pub fn effective_db(&self, cli_db: &Path, cli_explicit: bool) -> PathBuf {
+        let raw = if cli_explicit {
+            // User explicitly passed --db — honour it exactly
+            cli_db.to_path_buf()
+        } else if let Some(ref cfg_db) = self.db {
+            // config.toml has a db key
+            PathBuf::from(cfg_db)
+        } else {
+            // No --db flag, no config → use the safe absolute default
+            default_db_path()
+        };
+
+        let resolved = resolve_db_path(&raw);
+
+        // Best-effort directory creation
+        if let Err(e) = ensure_db_parent(&resolved) {
+            tracing::warn!(
+                "ai-memory: could not create database directory {}: {}",
+                resolved.parent().unwrap_or(&resolved).display(),
+                e
+            );
         }
-        // Otherwise check config
-        self.db
-            .as_ref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| cli_db.to_path_buf())
+
+        resolved
     }
 
     /// Resolve Ollama URL for LLM generation (config or default).
@@ -409,8 +527,12 @@ impl AppConfig {
 # Feature tier: keyword, semantic, smart, autonomous
 # tier = "semantic"
 
-# Path to SQLite database
-# db = "~/.claude/ai-memory.db"
+# Path to SQLite database (absolute path recommended).
+# When unset the default is ~/.local/share/ai-memory/ai-memory.db (XDG).
+# Tilde (~) is expanded to $HOME automatically.
+# WARNING: a relative path will create a separate database in every working
+#          directory — do NOT use a relative path unless you know what you are doing.
+# db = "~/.local/share/ai-memory/ai-memory.db"
 
 # Ollama base URL (for smart/autonomous tiers)
 # ollama_url = "http://localhost:11434"
@@ -539,5 +661,151 @@ mod tests {
         );
         // Config value used when no CLI
         assert_eq!(cfg.effective_tier(None), FeatureTier::Smart);
+    }
+
+    // -------------------------------------------------------------------
+    // Database path resolution tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn expand_tilde_home() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let result = super::expand_tilde(Path::new("~/foo/bar.db"));
+        assert_eq!(result, PathBuf::from(&home).join("foo/bar.db"));
+    }
+
+    #[test]
+    fn expand_tilde_bare() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let result = super::expand_tilde(Path::new("~"));
+        assert_eq!(result, PathBuf::from(&home));
+    }
+
+    #[test]
+    fn expand_tilde_absolute_unchanged() {
+        let result = super::expand_tilde(Path::new("/absolute/path.db"));
+        assert_eq!(result, PathBuf::from("/absolute/path.db"));
+    }
+
+    #[test]
+    fn expand_tilde_relative_unchanged() {
+        let result = super::expand_tilde(Path::new("relative.db"));
+        assert_eq!(result, PathBuf::from("relative.db"));
+    }
+
+    #[test]
+    fn expand_tilde_other_user_unchanged() {
+        // ~otheruser should NOT be expanded
+        let result = super::expand_tilde(Path::new("~otheruser/foo"));
+        assert_eq!(result, PathBuf::from("~otheruser/foo"));
+    }
+
+    #[test]
+    fn default_db_path_is_absolute() {
+        let p = super::default_db_path();
+        assert!(
+            p.is_absolute(),
+            "default_db_path() returned relative path: {}",
+            p.display()
+        );
+    }
+
+    #[test]
+    fn default_db_path_contains_ai_memory() {
+        let p = super::default_db_path();
+        let s = p.to_string_lossy();
+        assert!(
+            s.contains("ai-memory"),
+            "default path should contain 'ai-memory': {}",
+            s
+        );
+    }
+
+    #[test]
+    fn resolve_db_path_absolute_passes_through() {
+        let p = super::resolve_db_path(Path::new("/tmp/test.db"));
+        assert_eq!(p, PathBuf::from("/tmp/test.db"));
+    }
+
+    #[test]
+    fn resolve_db_path_tilde_expanded() {
+        let p = super::resolve_db_path(Path::new("~/test.db"));
+        assert!(
+            p.is_absolute(),
+            "tilde-expanded path should be absolute: {}",
+            p.display()
+        );
+        assert!(
+            p.to_string_lossy().ends_with("test.db"),
+            "should end with test.db: {}",
+            p.display()
+        );
+    }
+
+    #[test]
+    fn effective_db_explicit_cli_wins() {
+        let cfg = AppConfig {
+            db: Some("/config/path.db".to_string()),
+            ..Default::default()
+        };
+        let result = cfg.effective_db(Path::new("/cli/path.db"), true);
+        assert_eq!(result, PathBuf::from("/cli/path.db"));
+    }
+
+    #[test]
+    fn effective_db_config_used_when_no_cli() {
+        let cfg = AppConfig {
+            db: Some("/config/path.db".to_string()),
+            ..Default::default()
+        };
+        let result = cfg.effective_db(Path::new("ignored-default"), false);
+        assert_eq!(result, PathBuf::from("/config/path.db"));
+    }
+
+    #[test]
+    fn effective_db_default_when_no_cli_no_config() {
+        let cfg = AppConfig::default();
+        let result = cfg.effective_db(Path::new("ignored"), false);
+        // Should be the XDG default (absolute)
+        assert!(
+            result.is_absolute(),
+            "default effective_db should be absolute: {}",
+            result.display()
+        );
+    }
+
+    #[test]
+    fn effective_db_config_tilde_expanded() {
+        let cfg = AppConfig {
+            db: Some("~/my-memories.db".to_string()),
+            ..Default::default()
+        };
+        let result = cfg.effective_db(Path::new("ignored"), false);
+        assert!(
+            result.is_absolute(),
+            "tilde in config should be expanded: {}",
+            result.display()
+        );
+    }
+
+    #[test]
+    fn ensure_db_parent_creates_directory() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ai-memory-test-parent-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let db = tmp.join("sub/dir/test.db");
+        assert!(!tmp.exists());
+        super::ensure_db_parent(&db).unwrap();
+        assert!(tmp.join("sub/dir").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn ensure_db_parent_noop_for_existing() {
+        let tmp = std::env::temp_dir();
+        let db = tmp.join("test.db");
+        // Should not error on existing directory
+        super::ensure_db_parent(&db).unwrap();
     }
 }

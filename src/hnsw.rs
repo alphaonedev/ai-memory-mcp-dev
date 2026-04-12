@@ -97,10 +97,22 @@ impl VectorIndex {
         state.all_entries.push((id.clone(), embedding.clone()));
         state.overflow.push((id, embedding));
 
-        // Auto-rebuild if overflow is large
+        // Auto-rebuild if overflow is large (RT-03: catch_unwind to prevent corrupt state)
         if state.overflow.len() >= REBUILD_THRESHOLD {
-            state.hnsw = Self::build_hnsw(&state.all_entries);
-            state.overflow.clear();
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Self::build_hnsw(&state.all_entries)
+            })) {
+                Ok(new_hnsw) => {
+                    state.hnsw = new_hnsw;
+                    state.overflow.clear();
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "HNSW rebuild panicked — keeping overflow buffer, will retry on next insert"
+                    );
+                    // Don't clear overflow — entries are still accessible via linear scan
+                }
+            }
         }
     }
 

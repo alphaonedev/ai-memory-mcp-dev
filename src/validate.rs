@@ -3,6 +3,7 @@
 
 use anyhow::{bail, Result};
 
+use crate::fts;
 use crate::models::*;
 
 const MAX_TITLE_LEN: usize = 512;
@@ -34,13 +35,20 @@ fn is_clean_string(s: &str) -> bool {
         .any(|c| c == '\0' || (c.is_control() && c != '\t' && c != '\n' && c != '\r'))
 }
 
+/// Strip invisible/zero-width Unicode characters from a string (RT-10).
+/// This ensures stored content matches what FTS5 will search for.
+pub fn strip_invisible(s: &str) -> String {
+    s.chars().filter(|c| !fts::is_invisible_unicode(*c)).collect()
+}
+
 pub fn validate_title(title: &str) -> Result<()> {
     let trimmed = title.trim();
     if trimmed.is_empty() {
         bail!("title cannot be empty");
     }
-    if title.len() > MAX_TITLE_LEN {
-        bail!("title exceeds max length of {} bytes", MAX_TITLE_LEN);
+    // RT-18: use char count not byte count for length validation
+    if trimmed.chars().count() > MAX_TITLE_LEN {
+        bail!("title exceeds max length of {} characters", MAX_TITLE_LEN);
     }
     if !is_clean_string(trimmed) {
         bail!("title contains invalid characters");
@@ -408,9 +416,13 @@ mod tests {
     // RT-19: Whitespace-padded input rejected if too long
     #[test]
     fn test_title_length_includes_whitespace() {
-        // A title that's within limit when trimmed but over limit with whitespace
-        let padded = format!("{}x{}", " ".repeat(256), " ".repeat(256)); // 513 bytes
-        assert!(validate_title(&padded).is_err());
+        // RT-18/RT-19: length is now checked on trimmed chars, not raw bytes
+        // A title with lots of whitespace padding but short content should pass
+        let padded = format!("{}x{}", " ".repeat(256), " ".repeat(256));
+        assert!(validate_title(&padded).is_ok()); // trimmed = "x" (1 char)
+        // A title that's genuinely over 512 characters should fail
+        let long = "x".repeat(513);
+        assert!(validate_title(&long).is_err());
     }
 
     // RT-28: Source with whitespace is trimmed
@@ -427,5 +439,25 @@ mod tests {
         assert!(validate_id("has\ttab").is_err());
         assert!(validate_id("has\nnewline").is_err());
         assert!(validate_id("valid-id-123").is_ok());
+    }
+
+    // RT-10: strip_invisible removes zero-width chars
+    #[test]
+    fn test_strip_invisible() {
+        assert_eq!(strip_invisible("he\u{200B}llo"), "hello");
+        assert_eq!(strip_invisible("no\u{200D}join"), "nojoin");
+        assert_eq!(strip_invisible("\u{FEFF}bom"), "bom");
+        assert_eq!(strip_invisible("clean"), "clean");
+    }
+
+    // RT-18: title validation uses char count, not byte count
+    #[test]
+    fn test_title_char_count_not_bytes() {
+        // 200 CJK characters = 600 bytes but only 200 chars
+        let cjk_title: String = std::iter::repeat('中').take(200).collect();
+        assert!(validate_title(&cjk_title).is_ok(), "200 CJK chars should be within limit");
+        // 513 ASCII chars should fail
+        let long = "x".repeat(513);
+        assert!(validate_title(&long).is_err(), "513 chars should exceed limit");
     }
 }

@@ -2,7 +2,7 @@
 
 > **Note:** `ai-memory` is AI-agnostic and works with any MCP-compatible AI client (Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, OpenClaw, and others). This file contains **Claude Code-specific** integration instructions.
 
-This project is `ai-memory` -- a persistent memory daemon that replaces Claude Code's built-in auto-memory. **Zero token cost until recall** -- unlike auto-memory which loads 200+ lines into every conversation, ai-memory uses zero context tokens until explicitly called. **TOON compact** is the default response format (79% smaller than JSON). 226 tests (183 unit + 43 integration), 15/15 modules, 95%+ coverage. **LongMemEval benchmark: 97.8% R@5, 99.0% R@10, 99.8% R@20** (489/500, ICLR 2025 dataset).
+This project is `ai-memory` -- a persistent memory daemon that replaces Claude Code's built-in auto-memory. **Zero token cost until recall** -- unlike auto-memory which loads 200+ lines into every conversation, ai-memory uses zero context tokens until explicitly called. **TOON compact** is the default response format (79% smaller than JSON). 258 tests (209 unit + 49 integration), 15/15 modules, 95%+ coverage. **LongMemEval benchmark: 97.8% R@5, 99.0% R@10, 99.8% R@20** (489/500, ICLR 2025 dataset).
 
 ## Step 1: Disable Auto-Memory
 
@@ -93,7 +93,7 @@ ai-memory --db /root/.claude/ai-memory.db store \
 ### Namespace auto-detection:
 If you omit `--namespace`, it auto-detects from the git remote or directory name.
 
-### All 25 commands:
+### All 26 commands:
 - `mcp` -- run as MCP tool server over stdio (primary integration path)
 - `serve` -- start the HTTP daemon on port 9077
 - `store` -- store a new memory (deduplicates by title+namespace)
@@ -119,6 +119,7 @@ If you omit `--namespace`, it auto-detects from the git remote or directory name
 - `completions` -- generate shell completions (bash, zsh, fish)
 - `man` -- generate roff man page to stdout (pipe to `man -l -` to view)
 - `mine` -- import memories from historical conversations (Claude, ChatGPT, Slack exports)
+- `doctor` -- diagnose database fragmentation, detect stray databases, merge with `--fix`
 
 ### Feature tiers:
 - `keyword` -- FTS5 only, no embedding model, lowest resource usage
