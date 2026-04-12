@@ -392,6 +392,14 @@ pub async fn forget_memories(
     State(state): State<Db>,
     Json(body): Json<ForgetQuery>,
 ) -> impl IntoResponse {
+    // RT3-38: same safety check as MCP — require namespace when only tier specified
+    if body.tier.is_some() && body.namespace.is_none() && body.pattern.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "namespace is required when filtering by tier only (safety: prevents deleting memories across all projects)"})),
+        )
+            .into_response();
+    }
     let lock = state.lock().await;
     match db::forget(
         &lock.0,

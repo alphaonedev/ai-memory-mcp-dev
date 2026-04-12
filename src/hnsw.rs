@@ -179,11 +179,19 @@ impl VectorIndex {
 
         results.extend(overflow_hits);
 
-        // Deduplicate by ID (prefer lower distance)
+        // RT3-62: sort by distance BEFORE dedup so the first occurrence of each ID
+        // has the lowest (best) distance, whether from HNSW or overflow.
+        results.sort_by(|a, b| {
+            a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Deduplicate by ID (first occurrence = lowest distance after sort)
         let mut seen = std::collections::HashSet::new();
         results.retain(|hit| seen.insert(hit.id.clone()));
 
-        // Sort by distance and truncate
+        // Already sorted, just truncate
         results.sort_by(|a, b| {
             a.distance
                 .partial_cmp(&b.distance)

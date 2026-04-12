@@ -582,10 +582,17 @@ async fn serve(db_path: PathBuf, args: ServeArgs) -> Result<()> {
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // 50MB max request body
         .layer(
             CorsLayer::new()
+                // RT3-40: strict localhost check — require port/path separator after hostname
                 .allow_origin(AllowOrigin::predicate(
                     |origin: &axum::http::HeaderValue, _| {
                         origin.to_str().is_ok_and(|s| {
-                            s.starts_with("http://localhost") || s.starts_with("http://127.0.0.1")
+                            let is_localhost = s.starts_with("http://localhost:")
+                                || s.starts_with("http://localhost/")
+                                || s == "http://localhost";
+                            let is_loopback = s.starts_with("http://127.0.0.1:")
+                                || s.starts_with("http://127.0.0.1/")
+                                || s == "http://127.0.0.1";
+                            is_localhost || is_loopback
                         })
                     },
                 ))
@@ -699,7 +706,11 @@ fn cmd_store(db_path: PathBuf, args: StoreArgs, json_out: bool) -> Result<()> {
 
 fn cmd_update(db_path: PathBuf, args: UpdateArgs, json_out: bool) -> Result<()> {
     let conn = db::open(&db_path)?;
-    let tier = args.tier.as_deref().and_then(Tier::from_str);
+    // RT3-46: reject invalid tier instead of silently ignoring
+    let tier = match args.tier.as_deref() {
+        Some(t) => Some(Tier::from_str(t).ok_or_else(|| anyhow::anyhow!("invalid tier: {} (use short, mid, long)", t))?),
+        None => None,
+    };
     let tags: Option<Vec<String>> = args.tags.as_ref().map(|t| {
         t.split(',')
             .map(|s| s.trim().to_string())
@@ -746,6 +757,8 @@ fn cmd_update(db_path: PathBuf, args: UpdateArgs, json_out: bool) -> Result<()> 
         eprintln!("not found: {}", args.id);
         std::process::exit(1);
     }
+    // RT3-43: checkpoint WAL after write
+    let _ = db::checkpoint(&conn);
     if let Some(mem) = db::get(&conn, &args.id)? {
         if json_out {
             println!("{}", serde_json::to_string(&mem)?);
@@ -943,7 +956,11 @@ fn cmd_recall(
 fn cmd_search(db_path: PathBuf, args: SearchArgs, json_out: bool) -> Result<()> {
     let conn = db::open(&db_path)?;
     let _ = db::gc_if_needed(&conn);
-    let tier = args.tier.as_deref().and_then(Tier::from_str);
+    // RT3-47: reject invalid tier instead of silently ignoring
+    let tier = match args.tier.as_deref() {
+        Some(t) => Some(Tier::from_str(t).ok_or_else(|| anyhow::anyhow!("invalid tier: {} (use short, mid, long)", t))?),
+        None => None,
+    };
     let results = db::search(
         &conn,
         &args.query,
@@ -1015,7 +1032,11 @@ fn cmd_get(db_path: PathBuf, args: GetArgs, json_out: bool) -> Result<()> {
 fn cmd_list(db_path: PathBuf, args: ListArgs, json_out: bool) -> Result<()> {
     let conn = db::open(&db_path)?;
     let _ = db::gc_if_needed(&conn);
-    let tier = args.tier.as_deref().and_then(Tier::from_str);
+    // RT3-48: reject invalid tier instead of silently ignoring
+    let tier = match args.tier.as_deref() {
+        Some(t) => Some(Tier::from_str(t).ok_or_else(|| anyhow::anyhow!("invalid tier: {} (use short, mid, long)", t))?),
+        None => None,
+    };
     let results = db::list(
         &conn,
         args.namespace.as_deref(),
@@ -1059,6 +1080,8 @@ fn cmd_list(db_path: PathBuf, args: ListArgs, json_out: bool) -> Result<()> {
 fn cmd_delete(db_path: PathBuf, args: DeleteArgs, json_out: bool) -> Result<()> {
     let conn = db::open(&db_path)?;
     if db::delete(&conn, &args.id)? {
+        // RT3-43: checkpoint WAL after write
+        let _ = db::checkpoint(&conn);
         if json_out {
             println!("{}", serde_json::json!({"deleted": true, "id": args.id}));
         } else {
@@ -1687,7 +1710,8 @@ fn cmd_auto_consolidate(db_path: PathBuf, args: AutoConsolidateArgs, json_out: b
                 );
                 let content: String = group
                     .iter()
-                    .map(|m| format!("- {}: {}", m.title, &m.content[..m.content.len().min(200)]))
+                    // RT3-51: use chars().take() to avoid panic on multi-byte UTF-8
+                    .map(|m| format!("- {}: {}", m.title, m.content.chars().take(200).collect::<String>()))
                     .collect::<Vec<_>>()
                     .join("\n");
                 db::consolidate(
@@ -1859,7 +1883,8 @@ fn cmd_mine(db_path: PathBuf, args: MineArgs, json_out: bool) -> Result<()> {
             }
 
             // Commit in batches of 100
-            if imported.is_multiple_of(100) && imported > 0 {
+            #[allow(clippy::manual_is_multiple_of)]
+            if imported % 100 == 0 && imported > 0 {
                 conn.execute_batch("COMMIT")?;
                 conn.execute_batch("BEGIN IMMEDIATE")?;
             }

@@ -74,9 +74,10 @@ pub fn validate_namespace(ns: &str) -> Result<()> {
     if trimmed.is_empty() {
         bail!("namespace cannot be empty");
     }
-    if ns.len() > MAX_NAMESPACE_LEN {
+    // RT3-69: use char count consistently (matches title validation)
+    if trimmed.chars().count() > MAX_NAMESPACE_LEN {
         bail!(
-            "namespace exceeds max length of {} bytes",
+            "namespace exceeds max length of {} characters",
             MAX_NAMESPACE_LEN
         );
     }

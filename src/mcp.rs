@@ -138,6 +138,7 @@ fn tool_definitions() -> Value {
                         "namespace": {"type": "string"},
                         "tier": {"type": "string", "enum": ["short", "mid", "long"]},
                         "limit": {"type": "integer", "default": 20, "maximum": 200},
+                        "offset": {"type": "integer", "default": 0, "description": "Number of results to skip (for pagination)"},
                         "min_priority": {"type": "integer", "minimum": 1, "maximum": 10, "description": "Only return memories with priority >= this value"},
                         "since": {"type": "string", "description": "Only memories created after this RFC3339 timestamp"},
                         "until": {"type": "string", "description": "Only memories created before this RFC3339 timestamp"},
@@ -390,7 +391,12 @@ fn handle_store(
     let namespace = params["namespace"].as_str().unwrap_or("global").to_string();
     // RT-15: MCP default source is "claude" (matches the interface — AI clients are the callers)
     let source = params["source"].as_str().unwrap_or("claude").to_string();
-    let priority = params["priority"].as_i64().unwrap_or(5) as i32;
+    // RT3-23: validate range before cast to prevent silent truncation
+    let priority_i64 = params["priority"].as_i64().unwrap_or(5);
+    if !(1..=10).contains(&priority_i64) {
+        return Err(format!("priority must be between 1 and 10 (got {})", priority_i64));
+    }
+    let priority = priority_i64 as i32;
     let confidence = params["confidence"].as_f64().unwrap_or(1.0);
     let tags: Vec<String> = params["tags"]
         .as_array()
@@ -469,9 +475,11 @@ fn handle_store(
             None,                       // expires_at
         )
         .map_err(|e| e.to_string())?;
+        // RT3-26: re-read to report actual stored tier (not the incoming request tier)
+        let actual = db::get(conn, &dup.id).map_err(|e| e.to_string())?.unwrap_or(mem.clone());
         return Ok(json!({
             "id": dup.id,
-            "tier": mem.tier,
+            "tier": actual.tier,
             "title": mem.title,
             "namespace": mem.namespace,
             "duplicate": true,
@@ -677,7 +685,11 @@ fn handle_detect_contradiction(
 fn handle_search(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
     let query = params["query"].as_str().ok_or("query is required")?;
     let namespace = params["namespace"].as_str();
-    let tier = params["tier"].as_str().and_then(Tier::from_str);
+    // RT3-30: reject invalid tier instead of silently ignoring
+    let tier = match params["tier"].as_str() {
+        Some(t) => Some(Tier::from_str(t).ok_or(format!("invalid tier '{}' — must be short, mid, or long", t))?),
+        None => None,
+    };
     let limit = params["limit"].as_u64().unwrap_or(20) as usize;
     // RT-08: pass through filters that were previously only available in CLI/HTTP
     let min_priority = params["min_priority"].as_i64().map(|p| p as i32);
@@ -702,7 +714,11 @@ fn handle_search(conn: &rusqlite::Connection, params: &Value) -> Result<Value, S
 
 fn handle_list(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
     let namespace = params["namespace"].as_str();
-    let tier = params["tier"].as_str().and_then(Tier::from_str);
+    // RT3-30: reject invalid tier instead of silently ignoring
+    let tier = match params["tier"].as_str() {
+        Some(t) => Some(Tier::from_str(t).ok_or(format!("invalid tier '{}' — must be short, mid, or long", t))?),
+        None => None,
+    };
     let limit = params["limit"].as_u64().unwrap_or(20) as usize;
     // RT-08: pass through filters that were previously only available in CLI/HTTP
     let min_priority = params["min_priority"].as_i64().map(|p| p as i32);
@@ -710,12 +726,14 @@ fn handle_list(conn: &rusqlite::Connection, params: &Value) -> Result<Value, Str
     let until = params["until"].as_str();
     let tags = params["tags"].as_str();
 
+    // RT3-36: support pagination via offset parameter
+    let offset = params["offset"].as_u64().unwrap_or(0) as usize;
     let results = db::list(
         conn,
         namespace,
         tier.as_ref(),
         limit.min(200),
-        0,
+        offset.min(10_000),
         min_priority,
         since,
         until,
@@ -1662,5 +1680,72 @@ mod tests {
         let params = json!({"tags": "python"});
         let result = handle_list(&conn, &params).unwrap();
         assert_eq!(result["count"], 0);
+    }
+
+    // --- Red Team Phase 3 tests ---
+
+    // RT3-23: out-of-range priority rejected early
+    #[test]
+    fn store_rejects_out_of_range_priority() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let params = json!({"title": "Test", "content": "Content", "priority": 99});
+        let result = handle_store(&conn, &params, None, None);
+        assert!(result.is_err(), "priority 99 should be rejected");
+        assert!(result.unwrap_err().contains("priority"));
+    }
+
+    // RT3-30: invalid tier rejected in search
+    #[test]
+    fn search_rejects_invalid_tier() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let params = json!({"query": "test", "tier": "bogus"});
+        let result = handle_search(&conn, &params);
+        assert!(result.is_err(), "invalid tier should be rejected");
+        assert!(result.unwrap_err().contains("invalid tier"));
+    }
+
+    // RT3-30: invalid tier rejected in list
+    #[test]
+    fn list_rejects_invalid_tier() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let params = json!({"tier": "bogus"});
+        let result = handle_list(&conn, &params);
+        assert!(result.is_err(), "invalid tier should be rejected");
+    }
+
+    // RT3-36: MCP list supports offset
+    #[test]
+    fn list_handler_supports_offset() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        for i in 0..5 {
+            let mem = crate::models::Memory {
+                id: uuid::Uuid::new_v4().to_string(),
+                tier: Tier::Long, namespace: "test".into(),
+                title: format!("Mem {}", i), content: "Content".into(),
+                tags: vec![], priority: 5, confidence: 1.0,
+                source: "test".into(), access_count: 0,
+                created_at: now.clone(), updated_at: now.clone(),
+                last_accessed_at: None, expires_at: None,
+            };
+            db::insert(&conn, &mem).unwrap();
+        }
+        // Get all
+        let params = json!({"limit": 10});
+        let all = handle_list(&conn, &params).unwrap();
+        assert_eq!(all["count"], 5);
+        // Get with offset
+        let params = json!({"limit": 10, "offset": 3});
+        let paged = handle_list(&conn, &params).unwrap();
+        assert_eq!(paged["count"], 2, "offset=3 should return 2 of 5");
+    }
+
+    // RT3-36: list tool definition has offset param
+    #[test]
+    fn tool_definitions_list_has_offset() {
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().unwrap();
+        let list = tools.iter().find(|t| t["name"] == "memory_list").unwrap();
+        assert!(list["inputSchema"]["properties"].get("offset").is_some(), "missing offset");
     }
 }

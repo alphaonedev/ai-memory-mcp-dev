@@ -131,10 +131,15 @@ fn format_value(val: Option<&Value>) -> String {
     }
 }
 
-/// Escape pipe characters in TOON values.
+/// Escape special characters in TOON values.
+/// RT3-73: escape \r to prevent row corruption from Windows line endings.
+/// RT3-74: escape backslashes first to prevent ambiguous parsing.
 fn escape_toon(s: &str) -> String {
-    if s.contains('|') || s.contains('\n') {
-        s.replace('|', "\\|").replace('\n', "\\n")
+    if s.contains('\\') || s.contains('|') || s.contains('\n') || s.contains('\r') {
+        s.replace('\\', "\\\\")
+            .replace('|', "\\|")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
     } else {
         s.to_string()
     }
@@ -250,6 +255,23 @@ mod tests {
         let toon = memories_to_toon(&resp, false);
         assert!(toon.contains("content"), "full TOON header should include content field");
         assert!(toon.contains("Full content here"), "full TOON should include content value");
+    }
+
+    // RT3-73: carriage return escaped in TOON
+    #[test]
+    fn carriage_return_escaped() {
+        let resp = json!({"memories": [{"id": "x", "title": "A\r\nB", "tier": "mid"}], "count": 1});
+        let toon = memories_to_toon(&resp, true);
+        assert!(!toon.contains('\r'), "raw \\r should be escaped");
+        assert!(toon.contains("\\r"), "\\r should appear as escape sequence");
+    }
+
+    // RT3-74: backslash escaped in TOON
+    #[test]
+    fn backslash_escaped() {
+        let resp = json!({"memories": [{"id": "x", "title": "path\\file", "tier": "mid"}], "count": 1});
+        let toon = memories_to_toon(&resp, true);
+        assert!(toon.contains("path\\\\file"), "backslash should be doubled: {}", toon);
     }
 
     // RT-13: compact TOON still omits content (for token efficiency)
